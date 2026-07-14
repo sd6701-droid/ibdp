@@ -58,8 +58,37 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-module load anaconda3/gpu/2023.09     # substitute what `module avail anaconda` shows
-source activate ibdp
+# ---------------------------------------------------------------------------
+# CONDA: use YOUR miniconda, not the anaconda3 module.
+#
+# `module load anaconda3/gpu/2023.09` puts a DIFFERENT conda on PATH, one that
+# knows nothing about your miniconda envs -- which is why the first run died
+# with "Could not find conda environment: ibdp". Do not load that module here.
+#
+# Set CONDA_BASE to whatever `conda info --base` prints on the login node.
+# ---------------------------------------------------------------------------
+CONDA_BASE="${CONDA_BASE:-$HOME/miniconda3}"
+
+if [ ! -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+  echo "ERROR: no conda at $CONDA_BASE" >&2
+  echo "       Run 'conda info --base' on the login node and set CONDA_BASE" >&2
+  echo "       at the top of this script to that path." >&2
+  exit 1
+fi
+
+# conda.sh, not `module load` -- this is what makes `conda activate` work in a
+# non-interactive batch shell.
+source "$CONDA_BASE/etc/profile.d/conda.sh"
+conda activate ibdp
+
+# Fail now, with a useful message, rather than 10 lines later with "command not
+# found". yt-dlp is a pip package; ffmpeg must be in the env too, because above
+# 360p YouTube serves video and audio separately and yt-dlp shells out to
+# ffmpeg to mux them.
+command -v yt-dlp >/dev/null || { echo "ERROR: yt-dlp missing. pip install -U yt-dlp" >&2; exit 1; }
+command -v ffmpeg >/dev/null || { echo "ERROR: ffmpeg missing. conda install -c conda-forge ffmpeg" >&2; exit 1; }
+
+echo "env=$CONDA_PREFIX  yt-dlp=$(yt-dlp --version)"
 
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
 
