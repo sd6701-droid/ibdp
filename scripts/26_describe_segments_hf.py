@@ -33,7 +33,8 @@ NOTE: torchcodec needs the CUDA 12 NPP libs on LD_LIBRARY_PATH. Per shell:
     SITE=$(python -c "import site; print(site.getsitepackages()[0])")
     export LD_LIBRARY_PATH="$SITE/nvidia/npp/lib:$SITE/nvidia/cuda_nvrtc/lib:$LD_LIBRARY_PATH"
 """
-import argparse, json, os, re, time
+import argparse, hashlib, json, os, re, time
+from datetime import datetime
 from pathlib import Path
 
 # Must precede the qwen_vl_utils import. decord hangs on decode and is
@@ -195,7 +196,15 @@ def main():
     ap.add_argument("--videos", type=Path, default=ROOT / "youtube_dataset/videos")
     ap.add_argument("--manifest", type=Path,
                     default=ROOT / "youtube_dataset/manifest.tsv")
-    ap.add_argument("--out", type=Path, default=ROOT / "outputs/annotations.jsonl")
+    # Default: a NEW timestamped file per run, so a run never mutates an older
+    # one. Pass --out explicitly to override.
+    ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--outdir", type=Path, default=ROOT / "outputs")
+    # Resume scans every annotations_*.jsonl in --outdir, but only reuses records
+    # whose prompt hash matches the CURRENT prompt. Change the prompt and stale
+    # records are ignored and regenerated, rather than silently kept.
+    ap.add_argument("--resume", action="store_true",
+                    help="skip segments already done under the same prompt")
     ap.add_argument("--limit", type=int, default=0,
                     help="0 = all VIDEOS (not segments). Use 2 to measure speed.")
     ap.add_argument("--seconds", type=float, default=10.0, help="window length")
@@ -213,10 +222,20 @@ def main():
     if not torch.cuda.is_available():
         raise SystemExit("no GPU -- needs an A100 allocation, not a login node.")
 
+    # Stamped into every record. Two runs with different prompts are then
+    # distinguishable after the fact, and --resume can tell fresh from stale.
+    prompt_sha = hashlib.sha256(PROMPT.encode()).hexdigest()[:8]
+
+    args.outdir.mkdir(parents=True, exist_ok=True)
+    if args.out is None:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.out = args.outdir / f"annotations_{stamp}_{prompt_sha}.jsonl"
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
     meta = load_manifest(args.manifest)
     print(f"manifest: {len(meta)} videos", flush=True)
+    print(f"prompt:   {prompt_sha}", flush=True)
+    print(f"writing:  {args.out}", flush=True)
 
     clips = sorted(args.videos.glob("*.mp4"))
     if args.limit:
@@ -224,13 +243,29 @@ def main():
     if not clips:
         raise SystemExit(f"no .mp4 under {args.videos}")
 
+    # Resume across ALL prior runs, not just one file -- but only honour records
+    # written under the SAME prompt. A changed prompt makes old records stale,
+    # and silently skipping them would leave a corpus that is half one prompt
+    # and half another with nothing in the data to say which.
     done = set()
-    if args.out.exists():
-        with args.out.open() as f:
-            for line in f:
-                if line.strip():
-                    r = json.loads(line)
-                    done.add((r["video_id"], r["segment_index"]))
+    if args.resume:
+        stale = 0
+        for prev in sorted(args.outdir.glob("annotations_*.jsonl")):
+            with prev.open() as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if r.get("prompt_sha") != prompt_sha:
+                        stale += 1
+                        continue
+                    if r.get("parse_ok"):   # retry anything that failed to parse
+                        done.add((r["video_id"], r["segment_index"]))
+        print(f"resume:   {len(done)} done, {stale} stale (different prompt)",
+              flush=True)
 
     work, skipped = [], []
     for clip in clips:
@@ -322,6 +357,7 @@ def main():
                 bad += 1
 
             rec = {
+                "prompt_sha": prompt_sha,
                 "video_id": vid,
                 "video_name": title,
                 "url": url,
