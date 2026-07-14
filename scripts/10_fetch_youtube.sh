@@ -38,9 +38,12 @@ fi
 
 # ---- 1. Manifest -----------------------------------------------------------
 # --flat-playlist: read the channel index only, do not touch each video page.
+# NB: yt-dlp does NOT expand \t in --print -- it emits a literal backslash-t,
+# which silently produces a one-column "TSV". TAB below is a real tab.
+TAB=$'\t'
 echo "Listing channel -> $MANIFEST"
 yt-dlp --flat-playlist \
-       --print "%(id)s\t%(title)s\t%(duration)s\thttps://www.youtube.com/watch?v=%(id)s" \
+       --print "%(id)s${TAB}%(title)s${TAB}%(duration)s${TAB}https://www.youtube.com/watch?v=%(id)s" \
        "$CHANNEL" > "$MANIFEST"
 echo "  $(wc -l < "$MANIFEST") videos listed."
 
