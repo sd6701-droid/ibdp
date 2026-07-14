@@ -164,10 +164,26 @@ def main():
                 # mp4 -- no temp files, no re-muxing 11k clips to disk.
                 images, videos, video_kwargs = process_vision_info(
                     msgs, return_video_kwargs=True)
-                inputs = processor.apply_chat_template(
-                    msgs, add_generation_prompt=True, tokenize=True,
-                    return_dict=True, return_tensors="pt",
-                    video=videos, **video_kwargs,
+
+                # fps comes back as a LIST (one per video in the batch) --
+                # [1.992] -- but the processor validates it as a scalar float.
+                # Unwrap it. It feeds MRoPE's temporal positions, so it has to
+                # be the ACTUAL sampled rate, not the requested args.fps.
+                fps = video_kwargs.get("fps")
+                if isinstance(fps, (list, tuple)):
+                    fps = fps[0] if fps else args.fps
+
+                # Two-step: render the template to text, then call the processor
+                # with the decoded frames. Passing video kwargs through
+                # apply_chat_template(tokenize=True) is what broke.
+                text = processor.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True)
+                inputs = processor(
+                    text=[text],
+                    images=images if images else None,
+                    videos=videos,
+                    fps=fps,
+                    return_tensors="pt",
                 ).to(model.device)
 
                 with torch.inference_mode():
