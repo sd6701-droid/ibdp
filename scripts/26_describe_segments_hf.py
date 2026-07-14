@@ -34,7 +34,6 @@ NOTE: torchcodec needs the CUDA 12 NPP libs on LD_LIBRARY_PATH. Per shell:
     export LD_LIBRARY_PATH="$SITE/nvidia/npp/lib:$SITE/nvidia/cuda_nvrtc/lib:$LD_LIBRARY_PATH"
 """
 import argparse, hashlib, json, os, re, time
-from datetime import datetime
 from pathlib import Path
 
 # Must precede the qwen_vl_utils import. decord hangs on decode and is
@@ -219,8 +218,17 @@ def main():
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     if args.out is None:
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.out = args.outdir / f"annotations_{stamp}_{prompt_sha}.jsonl"
+        # Sequential counter: highest existing annotations_NNN_*.jsonl + 1.
+        # NOT "file count + 1" -- deleting a middle file would then make the
+        # next run collide with an existing higher number and append into it.
+        # Max-plus-one is always fresh.
+        nums = []
+        for f in args.outdir.glob("annotations_*.jsonl"):
+            m = re.match(r"annotations_(\d+)_", f.name)
+            if m:
+                nums.append(int(m.group(1)))
+        run_no = (max(nums) + 1) if nums else 1
+        args.out = args.outdir / f"annotations_{run_no:03d}_{prompt_sha}.jsonl"
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
     meta = load_manifest(args.manifest)

@@ -45,9 +45,12 @@ missing.txt      # reconcile output
 models/
 .cache/
 hf_cache/
+.hf/              # HF_HOME set by the fetch/serve scripts -- tens of GB
 *.safetensors
 *.gguf
 *.bin
+*.pt
+*.pth
 
 # SLURM
 slurm-*.out
