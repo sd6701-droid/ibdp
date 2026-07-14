@@ -52,46 +52,32 @@ MODEL = ROOT / "models/Qwen3-VL-30B-A3B-Instruct"
 # "infant" is defined explicitly. Left to itself the model drifts between
 # "baby", "toddler" and "young child" across segments, which makes the counts
 # useless to aggregate.
-PROMPT = """Analyse this video clip and answer with JSON ONLY -- no markdown, no \
-commentary, no code fences.
+PROMPT = """Analyse this clip. Reply with JSON only.
 
-An INFANT is a child who cannot yet walk unaided: roughly under 18 months. A \
-walking toddler or older child is NOT an infant; count them as an adult only if \
-they are clearly an adult, otherwise exclude them from both counts.
+Sort EVERY visible person into exactly one bucket; omit nobody:
+- INFANT: cannot walk unaided (crawls, sits, lies, is carried).
+- CHILD: walks unaided, not yet an adult.
+- ADULT: grown person.
 
-Return exactly this shape:
 {
-  "has_infant": true or false,
-  "num_infants": integer,
-  "has_adult": true or false,
-  "num_adults": integer,
-  "num_humans_total": integer,
-  "infant_visibility": "full_body" or "partial_body" or "not_visible",
+  "has_infant": bool,
+  "num_infants": int,
+  "num_children": int,
+  "has_adult": bool,
+  "num_adults": int,
+  "num_humans_total": int,
+  "infant_visibility": "full_body" | "partial_body" | "not_visible",
   "visible_infant_parts": ["head","face","torso","arms","hands","legs","feet"],
-  "description": "one or two dense sentences -- see below"
+  "description": "at most 2 sentences"
 }
 
-Rules:
-- Count DISTINCT people visible anywhere in the clip, not per frame.
-- "full_body": the whole infant, head to feet, is visible at some point.
-- "partial_body": only some of the infant is in frame (e.g. head and torso).
-- "not_visible": no infant in the clip. Then visible_infant_parts is [].
-- visible_infant_parts lists only parts you actually see; use [] if no infant.
-- If there is no infant, has_infant is false and num_infants is 0.
-
-The "description" must be AT MOST TWO SENTENCES, but every clause must carry
-information. Prefer concrete specifics -- who, where, what they physically do,
-what they touch -- over adjectives and mood. Name the infant's posture (lying,
-sitting, crawling, standing, held) and the main action. Report only what is
-actually visible; never guess or invent. Do not pad, do not editorialise, do
-not repeat yourself. Two tight sentences, then stop.
-
-Good: "An infant in a red shirt sits on a concrete driveway, gripping a green
-garden hose with both hands while water sprays over their legs. A white dog
-approaches from the left and the infant turns their head to watch it."
-
-Bad: "The video begins with a heartwarming scene. The atmosphere is playful and
-cheerful as the adorable child enjoys a wonderful moment outdoors." """
+- Count distinct people across the whole clip, not per frame.
+- num_humans_total = num_infants + num_children + num_adults.
+- full_body = whole infant head-to-feet seen at some point; partial_body = only
+  part of them; not_visible = no infant, and then parts is [].
+- description: max 2 sentences, concrete and specific -- who, where, what they
+  physically do, what they touch. Name the infant's posture. Only what is
+  visible; no mood, no padding, no repetition."""
 
 VALID_VISIBILITY = {"full_body", "partial_body", "not_visible"}
 VALID_PARTS = {"head", "face", "torso", "arms", "hands", "legs", "feet"}
@@ -172,6 +158,7 @@ def parse_annotation(raw: str) -> dict:
     ann = {
         "has_infant": as_bool(d.get("has_infant")),
         "num_infants": as_int(d.get("num_infants")),
+        "num_children": as_int(d.get("num_children")),
         "has_adult": as_bool(d.get("has_adult")),
         "num_adults": as_int(d.get("num_adults")),
         "num_humans_total": as_int(d.get("num_humans_total")),
@@ -180,12 +167,16 @@ def parse_annotation(raw: str) -> dict:
         "description": str(d.get("description", "")).strip(),
     }
 
-    # Self-consistency: the model sometimes says has_infant=true, num_infants=0.
-    # Trust the count and flag the disagreement rather than quietly picking one.
+    # Self-consistency. The model sometimes says has_infant=true with
+    # num_infants=0, or a total that does not add up. Flag the disagreement --
+    # do NOT quietly pick a winner, because a silently-corrected count is
+    # indistinguishable from a real observation when you aggregate later.
+    parts_sum = ann["num_infants"] + ann["num_children"] + ann["num_adults"]
     ann["inconsistent"] = bool(
         ann["has_infant"] != (ann["num_infants"] > 0)
         or ann["has_adult"] != (ann["num_adults"] > 0)
         or (not ann["has_infant"] and ann["visible_infant_parts"])
+        or ann["num_humans_total"] != parts_sum
     )
     ann["parse_ok"] = True
     return ann
