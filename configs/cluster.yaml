@@ -1,0 +1,37 @@
+# BigPurple settings.
+#
+# The CHANGEME values are deliberate: config.py raises on them rather than
+# guessing. Run scripts/00_probe_cluster.sh on a login node and fill these in
+# from its output.
+
+slurm:
+  partition: CHANGEME      # e.g. gpu4_medium -- from `sinfo`
+  account: CHANGEME        # from `sacctmgr show assoc user=$USER`
+  # Never let this land on a V100: no bf16 (CC 7.0), and FlashAttention-2
+  # does not build for Volta. Qwen3-VL will not run there.
+  constraint: a100
+  time_serve: "08:00:00"
+  time_batch: "04:00:00"
+  cpus_per_gpu: 8
+  mem_per_gpu_gb: 64
+
+paths:
+  # All of these live on /gpfs, never in $HOME (small quota) and never in git.
+  root: /gpfs/data/CHANGEME/ibdp        # your lab's project dir
+  models: /gpfs/data/CHANGEME/ibdp/models
+  # Scoped tightly on purpose: vLLM's --allowed-local-media-path makes
+  # EVERYTHING under this directory readable by the server process.
+  media: /gpfs/data/CHANGEME/ibdp/media
+  outputs: /gpfs/data/CHANGEME/ibdp/outputs
+  logs: /gpfs/data/CHANGEME/ibdp/logs
+  hf_home: /gpfs/data/CHANGEME/ibdp/.hf
+
+env:
+  # Compute nodes have no internet. This is both a practical necessity and the
+  # safety property we want: a model that cannot reach the network cannot leak
+  # a patient note to one.
+  hf_hub_offline: 1
+  # Qwen now recommends against decord (decode hangs, unmaintained).
+  video_reader: torchcodec
+  conda_env_serve: ibdp-serve
+  conda_env_batch: ibdp-batch

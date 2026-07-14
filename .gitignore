@@ -1,0 +1,74 @@
+# ---------------------------------------------------------------------------
+# PHI GUARD — nothing under these paths may ever reach git.
+# This project handles patient data on BigPurple. Keep it on the cluster.
+# ---------------------------------------------------------------------------
+data/
+inputs/
+outputs/
+results/
+runs/
+*.dcm
+*.nii
+*.nii.gz
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.csv
+*.tsv
+*.xlsx
+*.parquet
+*.jsonl
+
+# Scraped dataset. On the cluster this tree lives INSIDE the checkout
+# (/gpfs/scratch/$USER/personal/ibdp/youtube_dataset), so a bare `git add .`
+# would otherwise stage a few hundred sidecar files per download run.
+youtube_dataset/
+*.info.json      # yt-dlp per-video metadata
+*.vtt            # subtitles
+*.srt
+*.part           # in-flight downloads
+downloaded.txt   # yt-dlp archive (the resume record)
+missing.txt      # reconcile output
+
+# Explicit opt-in for synthetic / example assets only
+!examples/assets/**
+!docs/**/*.png
+
+# Models & caches (huge, live on /gpfs, never in git)
+models/
+.cache/
+hf_cache/
+*.safetensors
+*.gguf
+*.bin
+
+# SLURM
+slurm-*.out
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.egg-info/
+dist/
+build/
+.ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
+
+# Secrets
+.env.local
+*.key
+*.pem
+secrets.yaml

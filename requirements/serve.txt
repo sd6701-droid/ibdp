@@ -1,0 +1,9 @@
+# The vLLM serving env. Keep it MINIMAL.
+#
+# vLLM pins its own exact torch build and will fight anything that disagrees.
+# That is why this is a separate conda env from batch.txt -- mixing them is the
+# most common way this setup breaks.
+
+vllm==0.19.1        # min 0.11.0 for Qwen3-VL support; brings torch==2.11.0
+openai>=1.40        # client, pointed at our own server
+pyyaml>=6

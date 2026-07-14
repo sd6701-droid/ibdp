@@ -1,0 +1,14 @@
+# The batch / dev env: transformers directly, no vLLM.
+# Used by sbatch array jobs and for local authoring of prompts + schemas.
+
+transformers>=4.57.0      # first release with Qwen3-VL
+accelerate>=1.0
+qwen-vl-utils==0.0.14
+torchcodec                # video decode backend. NOT decord -- Qwen recommends
+                          # against it (decode hangs, unmaintained).
+pymupdf>=1.24             # PDF -> PNG. NOT pdf2image: that shells out to a
+                          # Poppler binary you cannot install on an HPC node.
+pydantic>=2
+openai>=1.40
+pyyaml>=6
+tqdm

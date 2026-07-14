@@ -1,0 +1,66 @@
+# Model registry.
+#
+# A100 is compute-capability 8.0. Native FP8 math needs >= 8.9 (Ada/Hopper).
+# vLLM will happily LOAD a -FP8 checkpoint here, but falls back to FP8-Marlin
+# weight-only (W8A16): you save VRAM and gain no speed, and Marlin's FP8 MoE
+# path has been incomplete. So: bf16 everywhere. If we ever go memory-bound,
+# reach for AWQ/GPTQ-Int4, not FP8.
+
+defaults:
+  dtype: bfloat16
+  # The 262k default reserves an enormous KV cache. 128k is the vLLM recipe's
+  # recommendation and still far more than we need.
+  max_model_len: 128000
+
+vision:
+  # Default. Fits a single A100-40 with room for video activations.
+  vl-8b:
+    repo_id: Qwen/Qwen3-VL-8B-Instruct
+    tensor_parallel_size: 1
+    gpus: 1
+    approx_vram_gb: 18
+    port: 8001
+
+  # Scale-up when 8B quality isn't enough. One A100-80, or TP2 across 40s.
+  vl-32b:
+    repo_id: Qwen/Qwen3-VL-32B-Instruct
+    tensor_parallel_size: 2
+    gpus: 2
+    approx_vram_gb: 66
+    port: 8001
+
+text:
+  # Hybrid-thinking checkpoint. There is no Qwen3-8B-Instruct-2507 -- the 2507
+  # refresh only covers 4B / 30B-A3B / 235B-A22B. Turn thinking off via the
+  # chat template instead (see client.py).
+  qwen3-8b:
+    repo_id: Qwen/Qwen3-8B
+    tensor_parallel_size: 1
+    gpus: 1
+    approx_vram_gb: 16
+    port: 8002
+
+  # Best quality per A100. MoE: 3.3B active, but all 30B of experts stay
+  # resident -- this is NOT a 3B model's memory footprint.
+  qwen3-30b-a3b:
+    repo_id: Qwen/Qwen3-30B-A3B-Instruct-2507
+    tensor_parallel_size: 2
+    gpus: 2
+    approx_vram_gb: 61
+    port: 8002
+    extra_args: ["--enable-expert-parallel"]
+
+# Multimodal per-prompt caps. Raising these raises memory reserved at profiling
+# time, so keep them at what we actually use.
+limits:
+  images_per_prompt: 8
+  videos_per_prompt: 1
+
+video:
+  # Vision tokens ~= total_pixels / (32*32). This is the real memory knob.
+  # When a long clip OOMs, lower total_pixels BEFORE lowering fps: you keep
+  # temporal coverage and give up spatial detail, which is the better trade.
+  fps: 2.0
+  min_pixels_factor: 4        # x 32 x 32
+  max_pixels_factor: 256      # x 32 x 32, per frame
+  total_pixels_factor: 20480  # x 32 x 32, whole-clip budget
