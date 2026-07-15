@@ -41,6 +41,30 @@ from pathlib import Path
 os.environ.setdefault("FORCE_QWENVL_VIDEO_READER", "torchcodec")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
+
+def _preload_cuda_libs():
+    """torchcodec's .so needs libnppicc.so.12 / libnvrtc, which live in the
+    pip nvidia-*-cu12 packages but are NOT on the default loader path. Rather
+    than require `export LD_LIBRARY_PATH=...` in every shell (which broke this
+    run three times), dlopen them RTLD_GLOBAL here so their symbols are resolved
+    when torchcodec loads. Silent if a lib is absent -- torchcodec then reports
+    its own clear error."""
+    import ctypes
+    import glob
+    import site
+    roots = list(site.getsitepackages())
+    if hasattr(site, "getusersitepackages"):
+        roots.append(site.getusersitepackages())
+    for sp in roots:
+        for so in glob.glob(os.path.join(sp, "nvidia", "*", "lib", "*.so*")):
+            try:
+                ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+
+
+_preload_cuda_libs()
+
 import torch
 from qwen_vl_utils import process_vision_info
 from transformers import AutoModelForImageTextToText, AutoProcessor
