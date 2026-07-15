@@ -222,9 +222,12 @@ def main():
         # NOT "file count + 1" -- deleting a middle file would then make the
         # next run collide with an existing higher number and append into it.
         # Max-plus-one is always fresh.
+        # Strict pattern: exactly 3 digits then the 8-hex prompt hash. A loose
+        # \d+ also matches the DATE in old timestamp-named files
+        # (annotations_20260714_...), which made the counter jump to 20260715.
         nums = []
         for f in args.outdir.glob("annotations_*.jsonl"):
-            m = re.match(r"annotations_(\d+)_", f.name)
+            m = re.match(r"annotations_(\d{3})_[0-9a-f]{8}\.jsonl$", f.name)
             if m:
                 nums.append(int(m.group(1)))
         run_no = (max(nums) + 1) if nums else 1
