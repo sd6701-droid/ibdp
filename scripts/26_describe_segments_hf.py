@@ -197,6 +197,8 @@ def main():
                     help="skip segments already done under the same prompt")
     ap.add_argument("--limit", type=int, default=0,
                     help="0 = all VIDEOS (not segments). Use 2 to measure speed.")
+    ap.add_argument("--only", default=None,
+                    help="comma-separated video id(s); process only these.")
     ap.add_argument("--seconds", type=float, default=10.0, help="window length")
     ap.add_argument("--min-tail", type=float, default=2.0)
     ap.add_argument("--fps", type=float, default=2.0)
@@ -240,6 +242,12 @@ def main():
     print(f"writing:  {args.out}", flush=True)
 
     clips = sorted(args.videos.glob("*.mp4"))
+    if args.only:
+        wanted = {s.strip() for s in args.only.split(",") if s.strip()}
+        clips = [c for c in clips if c.stem in wanted]
+        missing = wanted - {c.stem for c in clips}
+        if missing:
+            raise SystemExit(f"--only: no .mp4 for {sorted(missing)} under {args.videos}")
     if args.limit:
         clips = clips[: args.limit]
     if not clips:
