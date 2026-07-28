@@ -8,6 +8,20 @@ accelerate>=1.0           # required for device_map="auto" -- i.e. for sharding
                           # the 72B/78B across 4 cards at all.
 qwen-vl-utils==0.0.14
 
+# --- Qwen3-Omni (native audio+video) ---------------------------------------
+# A DIFFERENT package from qwen-vl-utils, not a newer one -- both are installed
+# and both are used. process_mm_info() takes use_audio_in_video and returns an
+# audio list qwen_vl_utils has no concept of.
+#
+# NB: qwen_omni_utils takes a whole file, NOT a [start,end] range, which is why
+# the omni backend re-cuts each segment to a temp mp4 instead of decoding a
+# sub-range in place like every other backend.
+qwen-omni-utils
+soundfile                 # qwen_omni_utils reads audio through it; the import
+                          # is unguarded, so its absence surfaces as an
+                          # ImportError from inside the util, not a clear error.
+librosa                   # resampling to the 16k the audio tower expects
+
 # --- InternVL3 (OpenGVLab/InternVL3-*) -------------------------------------
 # Its architecture is NOT in transformers. The modelling code ships inside the
 # checkpoint (modeling_internvl_chat.py, modeling_intern_vit.py, conversation.py)
@@ -26,6 +40,10 @@ torchcodec                # video decode backend. NOT decord -- Qwen recommends
                           # against it (decode hangs, unmaintained).
 pymupdf>=1.24             # PDF -> PNG. NOT pdf2image: that shells out to a
                           # Poppler binary you cannot install on an HPC node.
+wandb                     # optional: scripts/26 --wandb. Captures GPU util,
+                          # VRAM, power and temp automatically via NVML. Use
+                          # WANDB_MODE=offline on compute nodes -- online mode
+                          # blocks on init there and then drops metrics.
 pydantic>=2
 openai>=1.40
 pyyaml>=6

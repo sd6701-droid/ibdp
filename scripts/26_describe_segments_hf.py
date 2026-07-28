@@ -51,8 +51,11 @@ NOTE: torchcodec needs the CUDA 12 NPP libs on LD_LIBRARY_PATH. Per shell:
     SITE=$(python -c "import site; print(site.getsitepackages()[0])")
     export LD_LIBRARY_PATH="$SITE/nvidia/npp/lib:$SITE/nvidia/cuda_nvrtc/lib:$LD_LIBRARY_PATH"
 """
-import argparse, hashlib, json, os, re, time
+import argparse, atexit, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
+
+# audio_windows.py sits next to this file; the sbatch jobs cd elsewhere.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # Must precede the qwen_vl_utils import. decord hangs on decode and is
 # unmaintained; Qwen recommends torchcodec.
@@ -148,16 +151,25 @@ def detect_backend(model_dir: Path) -> str:
             arch = ""
         if "InternVL" in arch:
             return "internvl"
+        # Omni BEFORE the VL check: Qwen3OmniMoeForConditionalGeneration
+        # contains neither "VL" nor "Omni"-plus-"VL", but a future variant
+        # might -- and routing an Omni checkpoint to the qwen backend would
+        # load it as video-only and silently discard the audio, which is the
+        # one failure this whole comparison exists to avoid.
+        if "Omni" in arch:
+            return "qwen-omni"
         if "Qwen" in arch and "VL" in arch:
             return "qwen"
     name = model_dir.name.lower()
     if "internvl" in name:
         return "internvl"
+    if "omni" in name:
+        return "qwen-omni"
     if "qwen" in name and "vl" in name:
         return "qwen"
     raise SystemExit(
         f"cannot tell which backend {model_dir.name} needs. Pass --backend "
-        f"qwen|internvl explicitly.")
+        f"qwen|internvl|qwen-omni explicitly.")
 
 
 def _device_map():
@@ -184,7 +196,8 @@ class QwenAnnotator:
             str(model_dir), dtype=torch.bfloat16, device_map=_device_map())
         self.model.eval()
 
-    def annotate(self, clip: Path, start: float, end: float) -> str:
+    def annotate(self, clip: Path, start: float, end: float,
+                 prompt: str = PROMPT) -> str:
         args = self.args
         msgs = [{
             "role": "user",
@@ -195,7 +208,7 @@ class QwenAnnotator:
                 {"type": "video", "video": str(clip), "fps": args.fps,
                  "video_start": start, "video_end": end,
                  "total_pixels": args.total_pixels_factor * 32 * 32},
-                {"type": "text", "text": PROMPT},
+                {"type": "text", "text": prompt},
             ],
         }]
         images, videos, video_kwargs = self._process_vision_info(
@@ -378,16 +391,44 @@ class InternVLAnnotator:
         which is one frame past the window."""
         from torchcodec.decoders import VideoDecoder
 
+        dec = VideoDecoder(str(clip))
+
+        # CLAMP TO THE REAL STREAM, NOT THE MANIFEST.
+        #
+        # Segment bounds come from the manifest duration, which is yt-dlp's
+        # container metadata and routinely overshoots the decodable stream by a
+        # fraction of a second. On the FINAL window that makes the last sample
+        # land past the last frame and torchcodec refuses it outright:
+        #   "frame pts is 493.750000; must be less than 493.400000"
+        # which cost one segment per video per InternVL model. qwen_vl_utils
+        # clamps internally, which is why the Qwen backend never showed this.
+        md = getattr(dec, "metadata", None)
+        limit = None
+        for attr in ("end_stream_seconds", "duration_seconds"):
+            v = getattr(md, attr, None) if md is not None else None
+            if v:
+                limit = float(v)
+                break
+        if limit is not None:
+            # Strictly BELOW the limit: the check is exclusive.
+            end = min(end, limit - 1e-3)
+            start = min(start, end - 1e-3)
+
+        if end <= start:
+            raise ValueError(
+                f"window [{start:.2f},{end:.2f}] is empty after clamping to the "
+                f"stream ({limit}) -- the manifest duration overshoots the file.")
+
         n = int(round((end - start) * self.args.fps))
         n = max(1, min(self.args.max_frames, n))
         step = (end - start) / n
         stamps = [start + (i + 0.5) * step for i in range(n)]
 
-        dec = VideoDecoder(str(clip))
         batch = dec.get_frames_played_at(stamps)
         return batch.data          # (N, C, H, W) uint8
 
-    def annotate(self, clip: Path, start: float, end: float) -> str:
+    def annotate(self, clip: Path, start: float, end: float,
+                 prompt: str = PROMPT) -> str:
         from PIL import Image
 
         frames = self._frames(clip, start, end)
@@ -400,7 +441,7 @@ class InternVLAnnotator:
         # the Frame-N prefixes it treats the batch as unordered stills and
         # loses the temporal ordering the whole task depends on.
         prefix = "".join(f"Frame{i + 1}: <image>\n" for i in range(len(imgs)))
-        question = prefix + PROMPT
+        question = prefix + prompt
 
         with torch.inference_mode():
             out = self.model.chat(
@@ -415,7 +456,308 @@ class InternVLAnnotator:
         return str(out).strip()
 
 
-BACKENDS = {"qwen": QwenAnnotator, "internvl": InternVLAnnotator}
+class QwenOmniAnnotator:
+    """Qwen3-Omni. The only backend here that receives the AUDIO ITSELF.
+
+    The other three get a Whisper transcript in their prompt (--transcribe);
+    this one gets the waveform, so it can use crying, tone and room noise --
+    none of which survives transcription. That is the whole point of having it
+    in the comparison.
+
+    TWO THINGS DIFFER FROM QwenAnnotator, both forced:
+
+    1. qwen_omni_utils, not qwen_vl_utils. Different package, different entry
+       point (process_mm_info), and it takes use_audio_in_video to pull the
+       clip's own soundtrack rather than a separate audio file.
+
+    2. NO video_start/video_end. qwen_vl_utils decodes a sub-range out of the
+       full mp4, which is what lets every other backend segment without
+       touching the disk. process_mm_info takes a whole file, so a segment has
+       to BE a file -- hence _cut(), which writes a real 10s mp4 to a temp dir.
+       That is the cost of native audio here, and it is why this backend is
+       slower per segment than the frame-sampling ones.
+    """
+
+    def __init__(self, model_dir: Path, args):
+        from transformers import Qwen3OmniMoeForConditionalGeneration, AutoProcessor
+        from qwen_omni_utils import process_mm_info
+
+        self.args = args
+        self._process_mm_info = process_mm_info
+        self.processor = AutoProcessor.from_pretrained(str(model_dir))
+        self.model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
+            str(model_dir), dtype="auto", device_map="auto",
+            attn_implementation="sdpa")
+        # The talker synthesises SPEECH. We want JSON. Keeping it loaded costs
+        # several GB of VRAM to generate audio nothing ever reads.
+        if hasattr(self.model, "disable_talker"):
+            self.model.disable_talker()
+        self.model.eval()
+
+        self._tmp = Path(tempfile.mkdtemp(prefix="omni_seg_"))
+        # Segments are unlinked as they are used; this clears the directory
+        # itself, including anything left by a segment that raised mid-cut.
+        atexit.register(shutil.rmtree, self._tmp, True)
+
+    def _cut(self, clip: Path, start: float, end: float) -> Path:
+        """[start, end] of clip -> a real mp4, video AND audio.
+
+        Re-encoded, not -c copy: a stream copy snaps to the nearest keyframe,
+        which would put this backend on different frames than the others and
+        make the comparison meaningless. No -an here -- the audio is the point.
+
+        -t (duration), NOT -to (absolute stop): as an INPUT option the meaning
+        of -to has shifted between ffmpeg majors, and a silently mis-cut window
+        would look like a model disagreement rather than a bug.
+
+        crf 18 / veryfast, not ultrafast: this backend is the only one seeing
+        re-encoded pixels, so compression artefacts here are a confound the
+        other four do not carry. Near-visually-lossless is worth the seconds.
+        """
+        dst = self._tmp / f"{clip.stem}_{start:.3f}_{end:.3f}.mp4"
+        if dst.exists():
+            return dst
+        cmd = ["ffmpeg", "-y", "-loglevel", "error",
+               "-ss", str(start), "-t", str(end - start), "-i", str(clip),
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+               "-pix_fmt", "yuv420p", "-c:a", "aac", str(dst)]
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        if p.returncode != 0 or not dst.exists():
+            raise RuntimeError(f"ffmpeg could not cut {clip.name} "
+                               f"[{start:.2f},{end:.2f}]: {p.stderr.strip()}")
+        return dst
+
+    def annotate(self, clip: Path, start: float, end: float,
+                 prompt: str = PROMPT) -> str:
+        seg = self._cut(clip, start, end)
+        try:
+            msgs = [{
+                "role": "user",
+                "content": [
+                    {"type": "video", "video": str(seg),
+                     "fps": self.args.fps,
+                     "total_pixels": self.args.total_pixels_factor * 32 * 32},
+                    {"type": "text", "text": prompt},
+                ],
+            }]
+            text = self.processor.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True)
+            # use_audio_in_video MUST match between process_mm_info and the
+            # processor call. Mismatched, the audio and video token counts
+            # disagree and it fails deep inside the model with a shape error.
+            audios, images, videos = self._process_mm_info(
+                msgs, use_audio_in_video=True)
+            inputs = self.processor(
+                text=[text], audio=audios, images=images, videos=videos,
+                return_tensors="pt", padding=True,
+                use_audio_in_video=True,
+            ).to(self.model.device)
+
+            with torch.inference_mode():
+                out = self.model.generate(
+                    **inputs,
+                    max_new_tokens=self.args.max_new_tokens,
+                    do_sample=False,
+                    repetition_penalty=1.05,
+                    use_audio_in_video=True,
+                    return_audio=False,     # text out; no speech synthesis
+                )
+            if isinstance(out, (tuple, list)):
+                out = out[0]                # (text_ids, audio) when talker lives
+            return self.processor.batch_decode(
+                out[:, inputs["input_ids"].shape[1]:],
+                skip_special_tokens=True)[0].strip()
+        finally:
+            # Per segment, not per run: a 500s video at 10s windows would
+            # otherwise leave 50 re-encoded mp4s in $TMPDIR.
+            seg.unlink(missing_ok=True)
+
+
+BACKENDS = {"qwen": QwenAnnotator, "internvl": InternVLAnnotator,
+            "qwen-omni": QwenOmniAnnotator}
+
+
+# ---------------------------------------------------------------------------
+# Audio: transcript injected into the prompt (--transcribe)
+# ---------------------------------------------------------------------------
+# None of the VLMs here has an audio encoder, so "give the model the audio"
+# means giving it TEXT. This is the cheap half of that; the other half is a
+# real omni model, which sees the waveform itself.
+#
+# Appended, never interpolated into the middle of PROMPT: the JSON contract
+# above stays byte-identical, so a run with audio and a run without differ by
+# a suffix rather than by a reworded task.
+TRANSCRIPT_TEMPLATE = (
+    "\n\nAudio transcript of this clip (speech only; it may be empty, "
+    "inaccurate, or come from off-camera narration rather than the people you "
+    "can see):\n\"{transcript}\"\n"
+    "Use it only where it agrees with what is visible. Do NOT count a person "
+    "you cannot see just because you can hear them."
+)
+
+
+class CachedTranscriber:
+    """Whisper, run at most ONCE per video across every run and every model.
+
+    WHY CACHED RATHER THAN JUST TRANSCRIBED INLINE:
+    28_run_all_models.sh puts four models over the same video. Transcribing per
+    run costs four ASR passes for one result, and -- worse -- if any two passes
+    differ by a word, 27_compare_models.py is silently comparing models AND
+    transcripts at once. The cache makes the text an input to the comparison
+    instead of a variable in it.
+
+    The cache key is the video id plus the ASR model tag, so swapping Whisper
+    for something else does not quietly reuse the old text.
+    """
+
+    def __init__(self, model_dir: Path, cache_dir: Path, args):
+        self.model_dir = Path(model_dir)
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.args = args
+        self.tag = self.model_dir.name
+        self._pipe = None
+        self._mem: dict[str, list] = {}
+
+    def _load(self):
+        """Deferred: a cache hit on every video means Whisper never loads, and
+        that is the common case on a rerun."""
+        if self._pipe is not None:
+            return
+        from transformers import (AutoModelForSpeechSeq2Seq, AutoProcessor,
+                                  pipeline)
+        print(f"loading ASR: {self.tag}", flush=True)
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            str(self.model_dir), torch_dtype=dtype, low_cpu_mem_usage=True)
+        model.to("cuda:0" if torch.cuda.is_available() else "cpu")
+        proc = AutoProcessor.from_pretrained(str(self.model_dir))
+        self._pipe = pipeline(
+            "automatic-speech-recognition", model=model,
+            tokenizer=proc.tokenizer, feature_extractor=proc.feature_extractor,
+            torch_dtype=dtype, device=0 if torch.cuda.is_available() else -1,
+            chunk_length_s=30, return_timestamps="word")
+
+    def words(self, clip: Path) -> list:
+        """[{w, start, end}] for the whole track. Cached on disk and in memory.
+
+        Returns [] for a clip with no audio -- a silent video is a fact about
+        the corpus, not an error, and the annotation still has the frames.
+        """
+        vid = clip.stem
+        if vid in self._mem:
+            return self._mem[vid]
+
+        cache = self.cache_dir / f"{vid}.{self.tag}.json"
+        if cache.exists():
+            try:
+                self._mem[vid] = json.loads(cache.read_text())["words"]
+                return self._mem[vid]
+            except (json.JSONDecodeError, KeyError):
+                # A run killed mid-write leaves a truncated file. Redo it
+                # rather than propagating half a transcript.
+                cache.unlink(missing_ok=True)
+
+        from audio_windows import AudioWindows, NoAudioTrack
+        try:
+            wav = AudioWindows(clip).wav
+        except NoAudioTrack:
+            words = []
+        else:
+            self._load()
+            with torch.inference_mode():
+                out = self._pipe(
+                    wav, generate_kwargs={"language": self.args.language,
+                                          "task": "transcribe"})
+            words = []
+            for ch in out.get("chunks") or []:
+                ts = ch.get("timestamp") or (None, None)
+                a, b = ts[0], ts[1]
+                if a is None:
+                    continue
+                text = str(ch.get("text", "")).strip()
+                if text:
+                    words.append({"w": text, "start": float(a),
+                                  "end": float(b if b is not None else a)})
+
+        # Written atomically: two array-job tasks on the same video otherwise
+        # interleave into one unparseable file.
+        tmp = cache.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"model": self.tag, "video_id": vid,
+                                   "words": words}))
+        tmp.replace(cache)
+        self._mem[vid] = words
+        return words
+
+    def segment_text(self, clip: Path, start: float, end: float) -> str:
+        """Words whose MIDPOINT lands in [start, end).
+
+        Midpoint, not overlap: a word straddling the boundary would otherwise
+        be handed to both segments, and the per-segment transcripts would no
+        longer sum back to what was actually said.
+        """
+        out = [w["w"] for w in self.words(clip)
+               if start <= (w["start"] + w["end"]) / 2.0 < end]
+        return " ".join(out).strip()
+
+
+# ---------------------------------------------------------------------------
+# Weights & Biases
+# ---------------------------------------------------------------------------
+
+def init_wandb(args, model_tag, backend, prompt_sha, videos, n_segments):
+    """Start a W&B run, or return None when --wandb was not passed.
+
+    OFFLINE BY DEFAULT, and that default is the whole point: compute nodes here
+    have no outbound internet, and wandb.init() in online mode does not fail
+    fast on that -- it blocks, retries, and then drops your metrics while the
+    job appears to run normally. Offline writes to disk; you sync from a login
+    node afterwards (the command is printed at the end of the run).
+
+    Runs are GROUPED BY VIDEO and named by model, so the three models over one
+    video land in one comparable group in the W&B UI instead of three unrelated
+    runs you have to eyeball side by side."""
+    if not args.wandb:
+        return None
+    try:
+        import wandb
+    except ImportError:
+        raise SystemExit(
+            "--wandb needs the wandb package, which is not installed.\n"
+            "  Compute nodes have no internet, so install from a LOGIN node:\n"
+            "    ssh bigpurple-ln3 && conda activate ibdp && pip install wandb")
+
+    os.environ.setdefault("WANDB_MODE", args.wandb_mode)
+    # Run dirs on gpfs, never $HOME -- system metrics every few seconds for
+    # hours is not something to point at a small quota.
+    os.environ.setdefault("WANDB_DIR", str(args.outdir))
+
+    group = videos[0] if len(videos) == 1 else f"{len(videos)}-videos"
+    run = wandb.init(
+        project=args.wandb_project,
+        name=f"{model_tag}--{group}",
+        group=group,
+        job_type=model_tag,
+        config={
+            "model": model_tag,
+            "backend": backend,
+            "prompt_sha": prompt_sha,
+            "videos": videos,
+            "n_segments": n_segments,
+            "window_sec": args.seconds,
+            "fps": args.fps,
+            "max_new_tokens": args.max_new_tokens,
+            "total_pixels_factor": args.total_pixels_factor,
+            "max_frames": args.max_frames,
+            "n_gpus": torch.cuda.device_count(),
+            "gpu": torch.cuda.get_device_name(0),
+        },
+    )
+    # GPU utilisation, VRAM, power and temperature are captured automatically
+    # from here on -- that is the "track the GPU usage" part, no code needed.
+    print(f"wandb:    {os.environ.get('WANDB_MODE')} mode, run {run.name}",
+          flush=True)
+    return run
 
 
 def hhmmss(seconds: float) -> str:
@@ -523,6 +865,16 @@ def main():
                     help="local checkpoint dir under $ROOT/models")
     ap.add_argument("--backend", choices=sorted(BACKENDS),
                     help="override backend auto-detection")
+    ap.add_argument("--transcribe", action="store_true",
+                    help="transcribe the audio and put it in the prompt. "
+                         "Cached per video, so all models see the same text.")
+    ap.add_argument("--asr-model", type=Path,
+                    default=ROOT / "models/whisper-large-v3")
+    ap.add_argument("--asr-cache", type=Path,
+                    default=ROOT / "outputs/transcripts/cache")
+    ap.add_argument("--language", default="en",
+                    help="pinned, not auto-detected: a misdetect makes Whisper "
+                         "TRANSLATE, inventing fluent English nobody said.")
     ap.add_argument("--model-tag", default=None,
                     help="short name used in the output filename and in every "
                          "record (default: the checkpoint directory name)")
@@ -558,6 +910,13 @@ def main():
     # stops a long tail window from quietly becoming an OOM.
     ap.add_argument("--max-frames", type=int, default=32)
     ap.add_argument("--internvl-tile", type=int, default=448)
+    ap.add_argument("--wandb", action="store_true",
+                    help="log GPU usage + per-segment metrics to Weights & Biases")
+    ap.add_argument("--wandb-project", default="ibdp-annotation")
+    ap.add_argument("--wandb-mode", default="offline",
+                    choices=["offline", "online", "disabled"],
+                    help="offline is the default: compute nodes have no "
+                         "internet and online mode hangs there. Sync afterwards.")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -570,7 +929,14 @@ def main():
 
     # Stamped into every record. Two runs with different prompts are then
     # distinguishable after the fact, and --resume can tell fresh from stale.
-    prompt_sha = hashlib.sha256(PROMPT.encode()).hexdigest()[:8]
+    #
+    # --transcribe is folded into the hash. Without that, an audio run and a
+    # video-only run produce records that are indistinguishable, and --resume
+    # would treat the older ones as already done -- leaving a corpus that is
+    # half one modality and half the other with nothing in the data to say so.
+    prompt_sha = hashlib.sha256(
+        (PROMPT + (TRANSCRIPT_TEMPLATE if args.transcribe else "")).encode()
+    ).hexdigest()[:8]
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     if args.out is None:
@@ -669,6 +1035,22 @@ def main():
     if not work:
         return
 
+    # Before the weight load, so the load itself shows up in the GPU-memory
+    # trace -- that spike is exactly what you want to see when sizing a model
+    # against the cards you have.
+    run = init_wandb(args, model_tag, backend, prompt_sha,
+                     sorted({w[1] for w in work}), len(work))
+
+    asr = None
+    if args.transcribe:
+        if not args.asr_model.is_dir():
+            raise SystemExit(
+                f"--transcribe needs an ASR checkpoint at {args.asr_model}\n"
+                f"  fetch it on a LOGIN node: "
+                f"scripts/13_fetch_models.sh --only whisper-large-v3")
+        asr = CachedTranscriber(args.asr_model, args.asr_cache, args)
+        print(f"asr:      {asr.tag}  (cache: {args.asr_cache})", flush=True)
+
     annotator = BACKENDS[backend](args.model, args)
     ngpu = torch.cuda.device_count()
     print(f"ready on {ngpu} x {torch.cuda.get_device_name(0)}\n", flush=True)
@@ -680,8 +1062,25 @@ def main():
     with args.out.open("a") as fout:
         for k, (clip, vid, title, url, i, start, end) in enumerate(work, 1):
             t0 = time.time()
+
+            # Transcription is timed INSIDE the segment, but the cache means
+            # only the first segment of each video actually pays for it.
+            transcript = None
+            prompt = PROMPT
+            if asr is not None:
+                try:
+                    transcript = asr.segment_text(clip, start, end)
+                    prompt = PROMPT + TRANSCRIPT_TEMPLATE.format(
+                        transcript=transcript)
+                except Exception as e:
+                    # Falling back to video-only is correct, but it must be
+                    # visible: an annotation silently made without the audio
+                    # it was supposed to have is worse than a loud failure.
+                    print(f"[{k}/{n}] ASR FAIL {vid} seg {i}: {e}", flush=True)
+                    transcript = None
+
             try:
-                raw = annotator.annotate(clip, start, end)
+                raw = annotator.annotate(clip, start, end, prompt)
             except Exception as e:
                 print(f"[{k}/{n}] FAIL {vid} seg {i}: {e}", flush=True)
                 continue
@@ -714,12 +1113,42 @@ def main():
                 "start_sec": round(start, 2),
                 "end_sec": round(end, 2),
                 "timestamp": f"{hhmmss(start)}-{hhmmss(end)}",
+                # Stored so a description can be audited against what the model
+                # was actually told. "audio_mode" distinguishes a genuinely
+                # silent segment (transcript "") from a video-only run (null).
+                "audio_mode": ("transcript" if asr is not None else None),
+                "transcript": transcript,
                 **ann,
             }
             fout.write(json.dumps(rec) + "\n")
             fout.flush()   # survive a walltime kill
 
             rate = (time.time() - t_start) / max(ok + bad, 1)
+
+            if run is not None:
+                # max_memory_allocated is cumulative-max across the process, so
+                # on a sharded model it answers "did any card come close to the
+                # edge", which is the question that matters before scaling up.
+                peak = sum(torch.cuda.max_memory_allocated(d)
+                           for d in range(torch.cuda.device_count()))
+                metrics = {
+                    "segment/elapsed_sec": dt,
+                    "segment/parse_ok": int(ann["parse_ok"]),
+                    "run/parsed": ok,
+                    "run/unparseable": bad,
+                    "run/parse_rate": ok / max(ok + bad, 1),
+                    "run/avg_sec_per_segment": rate,
+                    "run/eta_hours": (n - k) * rate / 3600,
+                    "gpu/peak_alloc_gb": peak / 1e9,
+                }
+                if ann["parse_ok"]:
+                    metrics.update({
+                        "ann/num_infants": ann["num_infants"],
+                        "ann/num_adults": ann["num_adults"],
+                        "ann/num_humans_total": ann["num_humans_total"],
+                        "ann/inconsistent": int(ann["inconsistent"]),
+                    })
+                run.log(metrics, step=k)
             if ann["parse_ok"]:
                 flag = " INCONSISTENT" if ann["inconsistent"] else ""
                 summary = (f"infant={ann['num_infants']} adult={ann['num_adults']} "
@@ -734,6 +1163,24 @@ def main():
     print(f"\n{ok} parsed, {bad} unparseable, of {n} segments "
           f"in {total/60:.1f} min ({total/max(ok+bad,1):.1f}s each)")
     print(f"wrote {args.out}")
+
+    if run is not None:
+        run.summary.update({
+            "segments_attempted": n,
+            "parsed": ok,
+            "unparseable": bad,
+            "parse_rate": ok / max(ok + bad, 1),
+            "total_minutes": total / 60,
+            "sec_per_segment": total / max(ok + bad, 1),
+            "output_file": args.out.name,
+        })
+        run.finish()
+        # Offline runs are inert until synced, and a run nobody syncs is a run
+        # nobody sees. Print the exact command rather than leaving it to be
+        # rediscovered later.
+        if os.environ.get("WANDB_MODE") == "offline":
+            print(f"\nwandb: offline. From a LOGIN node, sync with:\n"
+                  f"  wandb sync {args.outdir}/wandb/offline-run-*")
 
 
 if __name__ == "__main__":

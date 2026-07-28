@@ -38,6 +38,8 @@ REGISTRY="
 qwen25-vl-72b|Qwen/Qwen2.5-VL-72B-Instruct|Qwen2.5-VL-72B-Instruct|145|4|qwen_vl_utils works as-is
 internvl3-78b|OpenGVLab/InternVL3-78B|InternVL3-78B|156|4|needs trust_remote_code + new video path
 internvl3-38b|OpenGVLab/InternVL3-38B|InternVL3-38B|76|2|needs trust_remote_code + new video path
+whisper-large-v3|openai/whisper-large-v3|whisper-large-v3|3|1|audio only; scripts/31
+qwen3-omni-30b|Qwen/Qwen3-Omni-30B-A3B-Instruct|Qwen3-Omni-30B-A3B-Instruct|71|2|NATIVE AUDIO+VIDEO; needs qwen-omni-utils
 "
 
 ONLY=""; DRY=0; LIST=0

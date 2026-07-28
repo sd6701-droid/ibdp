@@ -24,8 +24,33 @@ OUTDIR="${OUTDIR:-$ROOT/outputs}"
 LOGDIR="$OUTDIR/logs"
 
 # Ordered smallest-first: if something in the harness is wrong you find out on
-# the 76GB model in a few minutes, not 40 minutes into loading the 78B.
-MODELS="${MODELS:-InternVL3-38B Qwen2.5-VL-72B-Instruct InternVL3-78B}"
+# the 61GB model in a couple of minutes, not 40 minutes into loading the 78B.
+#
+#   Qwen3-VL-30B-A3B-Instruct   ~61GB   MoE, only ~3.3B params active per token
+#   Qwen3-Omni-30B-A3B-Instruct ~71GB   MoE, NATIVE AUDIO + video
+#   InternVL3-38B               ~76GB   dense
+#   Qwen2.5-VL-72B-Instruct    ~145GB   dense, older generation than Qwen3-VL
+#   InternVL3-78B              ~156GB   dense
+#
+# The 30B-A3B is the incumbent -- the one the existing corpus was annotated
+# with. It belongs in the comparison as the BASELINE: the question is not just
+# which of the new models is best, but whether any of them beats what you
+# already have enough to justify re-annotating 11.6k segments.
+#
+# Qwen3-Omni sits directly after it ON PURPOSE. Same family, same MoE size, so
+# the pair isolates ONE variable: does hearing the clip beat only seeing it?
+# Any other ordering confounds that with a size or generation difference.
+MODELS="${MODELS:-Qwen3-VL-30B-A3B-Instruct Qwen3-Omni-30B-A3B-Instruct InternVL3-38B Qwen2.5-VL-72B-Instruct InternVL3-78B}"
+
+# --- Audio ------------------------------------------------------------------
+# AUDIO=1 gives the four video-only models a Whisper transcript in the prompt.
+# Qwen3-Omni ignores it -- it gets the waveform itself.
+#
+# WHY THIS IS A SEPARATE SWITCH rather than always-on: --transcribe changes
+# prompt_sha, so audio and video-only records never resume into each other.
+# Flipping it mid-corpus is safe; it just re-annotates rather than silently
+# mixing two modalities in one file.
+AUDIO="${AUDIO:-0}"
 
 VIDEO="${1:-}"
 shift 2>/dev/null || true
@@ -80,6 +105,38 @@ if echo "$MODELS" | grep -qi internvl; then
     exit 1; }
 fi
 
+# Same reasoning for Omni: a different utils package, and a transformers new
+# enough to know the architecture at all. Both are unfixable from here.
+if echo "$MODELS" | grep -qi omni; then
+  python - <<'PY' || exit 1
+import sys
+try:
+    import qwen_omni_utils, soundfile        # noqa: F401
+except ImportError as e:
+    sys.exit(f"ERROR: Qwen3-Omni needs qwen-omni-utils + soundfile ({e}).\n"
+             "       Compute nodes have no internet -- install from a LOGIN node:\n"
+             "         ssh bigpurple-ln3 && conda activate ibdp && "
+             "pip install qwen-omni-utils soundfile librosa")
+try:
+    from transformers import Qwen3OmniMoeForConditionalGeneration  # noqa: F401
+except ImportError:
+    import transformers
+    sys.exit(f"ERROR: transformers {transformers.__version__} does not have "
+             "Qwen3OmniMoeForConditionalGeneration.\n"
+             "       ssh bigpurple-ln3 && conda activate ibdp && "
+             "pip install -U 'transformers>=4.57'")
+PY
+fi
+
+# --transcribe loads Whisper from disk like everything else here.
+if [[ "$AUDIO" == "1" ]]; then
+  [[ -d "$ROOT/models/whisper-large-v3" ]] || {
+    echo "ERROR: AUDIO=1 needs $ROOT/models/whisper-large-v3" >&2
+    echo "       fetch it on a LOGIN node:" >&2
+    echo "         scripts/13_fetch_models.sh --only whisper-large-v3" >&2
+    exit 1; }
+fi
+
 export HF_HUB_OFFLINE=1                 # weights are local; fail fast, don't hang
 export FORCE_QWENVL_VIDEO_READER=torchcodec
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -87,6 +144,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 echo
 echo "video  : $VIDEO"
 echo "models : $MODELS"
+echo "audio  : $([[ "$AUDIO" == "1" ]] && echo "transcript in prompt (Omni: native)" || echo "off (video only)")"
 echo "outdir : $OUTDIR"
 echo "extra  : ${EXTRA[*]:-(none)}"
 echo
@@ -105,11 +163,20 @@ for M in $MODELS; do
   echo "==============================================================="
   t0=$SECONDS
 
+  # Qwen3-Omni takes the audio natively, so handing it a transcript as well
+  # would let it answer from text it was supposed to hear -- and the run would
+  # no longer measure what native audio is worth.
+  declare -a AUDIO_ARGS=()
+  if [[ "$AUDIO" == "1" && "$M" != *Omni* ]]; then
+    AUDIO_ARGS=(--transcribe)
+  fi
+
   python scripts/26_describe_segments_hf.py \
       --model "$ROOT/models/$M" \
       --only "$VIDEO" \
       --outdir "$OUTDIR" \
       --resume \
+      "${AUDIO_ARGS[@]}" \
       "${EXTRA[@]}" 2>&1 | tee "$log"
 
   # PIPESTATUS[0], not $?: $? is tee's status, which is 0 even when python died.
@@ -149,3 +216,16 @@ python scripts/27_compare_models.py \
 echo
 echo "report : $txt"
 echo "table  : $csv"
+
+# ---------------------------------------------------------------------------
+# W&B: offline runs are inert files until synced, and this node cannot do it.
+# ---------------------------------------------------------------------------
+if compgen -G "$OUTDIR/wandb/offline-run-*" > /dev/null; then
+  n_runs=$(compgen -G "$OUTDIR/wandb/offline-run-*" | wc -l | tr -d ' ')
+  echo
+  echo "wandb  : $n_runs offline run(s) not yet uploaded."
+  echo "         From a LOGIN node (this one has no internet):"
+  echo "           ssh bigpurple-ln3 && conda activate ibdp"
+  echo "           wandb login                      # once"
+  echo "           wandb sync $OUTDIR/wandb/offline-run-*"
+fi
