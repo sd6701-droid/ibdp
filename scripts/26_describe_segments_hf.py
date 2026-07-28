@@ -155,7 +155,16 @@ object:
   "audio_events": [%s],
   "infant_vocalising": bool,
   "speech_present": bool,
-  "audio_description": "at most 1 sentence"
+  "audio_description": "at most 2 sentences"
+
+THE TWO DESCRIPTIONS ARE SEPARATE AND MUST NOT OVERLAP:
+- "description" is what you SEE. Write it as if the clip were silent. Never
+  mention a sound, a voice, or anything you only know by hearing it.
+- "audio_description" is what you HEAR. Write it as if you could not see the
+  clip. Never mention a colour, a place, an object or an action you only know
+  by looking at it.
+Someone reading the two together should be able to tell which sense each came
+from. If a fact appears in both, it belongs in only one of them.
 
 - audio_events: every category actually AUDIBLE. [] if there is no sound at
   all; use "silence" only when the clip has an audio track that is silent.
@@ -164,8 +173,9 @@ object:
 - infant_vocalising covers any infant sound -- cry, babble, laugh, grunt.
 - speech_present: any intelligible human speech, including a narrator or
   someone off-camera.
-- audio_description: one sentence on what is heard. If narration comes from
-  someone not visible, say so.
+- audio_description: what is heard, and who or what makes it. Say if a voice
+  comes from someone not visible. Do not speculate about a cause you cannot
+  hear.
 - Do NOT let the audio change your visual counts. Someone you only hear is not
   a visible person.""" % ", ".join(f'"{e}"' for e in AUDIO_EVENTS)
 
