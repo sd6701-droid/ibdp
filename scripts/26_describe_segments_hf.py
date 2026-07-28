@@ -24,10 +24,28 @@ greedy decoding (one segment repeated "the baby is still splashing" until it hit
 the token cap). Structured output is shorter, faster, parseable, and cannot
 ramble.
 
-Resume is per SEGMENT, so a walltime kill costs nothing. Rerun to continue.
+Resume is per (MODEL, SEGMENT), so a walltime kill costs nothing. Rerun to
+continue.
 
     python scripts/26_describe_segments_hf.py --limit 2    # measure first
     python scripts/26_describe_segments_hf.py              # then the rest
+
+MULTI-MODEL: --model points at any local checkpoint. Two backends are supported
+and picked automatically from the checkpoint:
+
+    Qwen*-VL     transformers + qwen_vl_utils, which decodes [start,end] out of
+                 the full mp4 for us.
+    InternVL3*   trust_remote_code + model.chat(). qwen_vl_utils does NOT drive
+                 it, so we sample the window's frames ourselves with torchcodec
+                 and hand InternVL one 448px tile per frame.
+
+Every record carries "model", the output filename carries the model tag, and
+--resume only reuses records from the SAME model. Running three models over one
+video therefore gives you three independent files:
+
+    for M in Qwen2.5-VL-72B-Instruct InternVL3-78B InternVL3-38B; do
+      python scripts/26_describe_segments_hf.py --model $ROOT/models/$M --only VIDEOID
+    done
 
 NOTE: torchcodec needs the CUDA 12 NPP libs on LD_LIBRARY_PATH. Per shell:
     SITE=$(python -c "import site; print(site.getsitepackages()[0])")
@@ -66,11 +84,15 @@ def _preload_cuda_libs():
 _preload_cuda_libs()
 
 import torch
-from qwen_vl_utils import process_vision_info
-from transformers import AutoModelForImageTextToText, AutoProcessor
 
 ROOT = Path("/gpfs/scratch/sd6701/personal/ibdp")
-MODEL = ROOT / "models/Qwen3-VL-30B-A3B-Instruct"
+DEFAULT_MODEL = ROOT / "models/Qwen3-VL-30B-A3B-Instruct"
+
+# Records written before this script grew a --model flag have no "model" field.
+# They all came from the checkpoint below, so that is what they are credited to
+# on resume -- otherwise every one of them would look like a foreign model's
+# work and be regenerated.
+LEGACY_MODEL_TAG = "Qwen3-VL-30B-A3B-Instruct"
 
 # "infant" is defined explicitly. Left to itself the model drifts between
 # "baby", "toddler" and "young child" across segments, which makes the counts
@@ -104,6 +126,222 @@ Sort EVERY visible person into exactly one bucket; omit nobody:
 
 VALID_VISIBILITY = {"full_body", "partial_body", "not_visible"}
 VALID_PARTS = {"head", "face", "torso", "arms", "hands", "legs", "feet"}
+
+
+# ---------------------------------------------------------------------------
+# Backends
+#
+# Both expose the same one-method contract -- annotate(clip, start, end) -> raw
+# model text -- so main()'s loop, the JSON parsing and the resume logic are
+# identical no matter which checkpoint is loaded.
+# ---------------------------------------------------------------------------
+
+def detect_backend(model_dir: Path) -> str:
+    """Checkpoint -> backend name. Reads config.json's architectures first,
+    because that is authoritative; the directory name is only a fallback for a
+    checkpoint that was renamed on download."""
+    cfg = model_dir / "config.json"
+    if cfg.is_file():
+        try:
+            arch = " ".join(json.loads(cfg.read_text()).get("architectures") or [])
+        except (json.JSONDecodeError, OSError):
+            arch = ""
+        if "InternVL" in arch:
+            return "internvl"
+        if "Qwen" in arch and "VL" in arch:
+            return "qwen"
+    name = model_dir.name.lower()
+    if "internvl" in name:
+        return "internvl"
+    if "qwen" in name and "vl" in name:
+        return "qwen"
+    raise SystemExit(
+        f"cannot tell which backend {model_dir.name} needs. Pass --backend "
+        f"qwen|internvl explicitly.")
+
+
+def _device_map():
+    """'auto' shards a 72B/78B across every visible card. Single-GPU stays on
+    cuda:0 -- 'auto' there can still offload to CPU under memory pressure and
+    turn a 12s segment into minutes with no error to explain why."""
+    return "auto" if torch.cuda.device_count() > 1 else "cuda:0"
+
+
+class QwenAnnotator:
+    """Qwen*-VL. qwen_vl_utils decodes only [video_start, video_end] out of the
+    full mp4, so nothing is ever extracted to disk."""
+
+    def __init__(self, model_dir: Path, args):
+        from qwen_vl_utils import process_vision_info
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+
+        self._process_vision_info = process_vision_info
+        self.args = args
+        self.processor = AutoProcessor.from_pretrained(str(model_dir))
+        print(f"loading weights from {model_dir.name} (off GPFS, minutes for a "
+              f"72B)...", flush=True)
+        self.model = AutoModelForImageTextToText.from_pretrained(
+            str(model_dir), dtype=torch.bfloat16, device_map=_device_map())
+        self.model.eval()
+
+    def annotate(self, clip: Path, start: float, end: float) -> str:
+        args = self.args
+        msgs = [{
+            "role": "user",
+            "content": [
+                # total_pixels is the real memory knob, not fps. If a clip
+                # OOMs, lower total_pixels first -- you keep temporal
+                # coverage and give up spatial detail, the better trade.
+                {"type": "video", "video": str(clip), "fps": args.fps,
+                 "video_start": start, "video_end": end,
+                 "total_pixels": args.total_pixels_factor * 32 * 32},
+                {"type": "text", "text": PROMPT},
+            ],
+        }]
+        images, videos, video_kwargs = self._process_vision_info(
+            msgs, return_video_kwargs=True)
+
+        # fps comes back as a LIST (one per video in the batch) -- the
+        # processor validates it as a scalar. It feeds MRoPE's temporal
+        # positions, so use the ACTUAL sampled rate, not args.fps.
+        fps = video_kwargs.get("fps")
+        if isinstance(fps, (list, tuple)):
+            fps = fps[0] if fps else args.fps
+
+        text = self.processor.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True)
+        inputs = self.processor(
+            text=[text],
+            images=images if images else None,
+            videos=videos,
+            fps=fps,
+            return_tensors="pt",
+        ).to(self.model.device)
+
+        with torch.inference_mode():
+            out = self.model.generate(
+                **inputs,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=False,          # deterministic: this is extraction
+                repetition_penalty=1.05,  # greedy decoding looped without it
+            )
+        return self.processor.batch_decode(
+            out[:, inputs["input_ids"].shape[1]:],
+            skip_special_tokens=True)[0].strip()
+
+
+class InternVLAnnotator:
+    """InternVL3. No qwen_vl_utils: we sample the window ourselves and feed one
+    448px tile per frame, which is what InternVL's own video example does.
+
+    Single tile per frame ON PURPOSE. InternVL's dynamic tiling can emit up to
+    12 tiles for ONE image; at 20 frames per 10s window that is 240 tiles and a
+    guaranteed OOM. Tiling buys spatial detail on a still image, which is not
+    what a 10-second infant-motion clip is asking for."""
+
+    IMAGENET_MEAN = (0.485, 0.456, 0.406)
+    IMAGENET_STD = (0.229, 0.224, 0.225)
+
+    @staticmethod
+    def _check_deps(model_dir: Path):
+        """Fail here, legibly, rather than 40 frames into a traceback from
+        inside transformers' dynamic module loader.
+
+        InternVL's architecture is not part of transformers -- it is vendored in
+        the checkpoint and loaded with trust_remote_code. That vendored code
+        hard-imports einops and timm. If the .py files are missing the download
+        was incomplete, which `ls` will not tell you."""
+        needed = ["modeling_internvl_chat.py", "modeling_intern_vit.py",
+                  "configuration_internvl_chat.py", "conversation.py"]
+        missing = [f for f in needed if not (model_dir / f).is_file()]
+        if missing:
+            raise SystemExit(
+                f"{model_dir.name} is missing its vendored architecture code: "
+                f"{', '.join(missing)}\n"
+                f"  Re-download: scripts/13_fetch_models.sh --only "
+                f"internvl3-{'78b' if '78' in model_dir.name else '38b'}\n"
+                f"  (rm {model_dir}/.complete first to force it)")
+
+        # importlib.util, not importlib: the submodule is not bound by a bare
+        # `import importlib`, so find_spec would raise AttributeError here.
+        import importlib.util
+        for mod, pip in (("einops", "einops"), ("timm", "timm>=0.9")):
+            if importlib.util.find_spec(mod) is None:
+                raise SystemExit(
+                    f"InternVL's vendored code imports `{mod}`, which is not "
+                    f"installed.\n  conda activate ibdp && pip install '{pip}'")
+
+    def __init__(self, model_dir: Path, args):
+        import torchvision.transforms as T
+        from torchvision.transforms.functional import InterpolationMode
+        from transformers import AutoModel, AutoTokenizer
+
+        self._check_deps(model_dir)
+        self.args = args
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            str(model_dir), trust_remote_code=True, use_fast=False)
+        print(f"loading weights from {model_dir.name} (off GPFS, minutes for a "
+              f"78B)...", flush=True)
+        # trust_remote_code: InternVL ships its own modelling code, including
+        # the .chat() helper used below. AutoModelForImageTextToText does not
+        # cover it.
+        self.model = AutoModel.from_pretrained(
+            str(model_dir), dtype=torch.bfloat16, trust_remote_code=True,
+            low_cpu_mem_usage=True, device_map=_device_map()).eval()
+
+        size = args.internvl_tile
+        self.transform = T.Compose([
+            T.Lambda(lambda im: im.convert("RGB")),
+            T.Resize((size, size), interpolation=InterpolationMode.BICUBIC),
+            T.ToTensor(),
+            T.Normalize(mean=self.IMAGENET_MEAN, std=self.IMAGENET_STD),
+        ])
+
+    def _frames(self, clip: Path, start: float, end: float):
+        """Frames from [start, end], sampled at args.fps and hard-capped.
+        Timestamps are bin CENTRES, so a 10s window at 2fps samples 0.25s,
+        0.75s ... rather than clipping the boundary frame at exactly `end`,
+        which is one frame past the window."""
+        from torchcodec.decoders import VideoDecoder
+
+        n = int(round((end - start) * self.args.fps))
+        n = max(1, min(self.args.max_frames, n))
+        step = (end - start) / n
+        stamps = [start + (i + 0.5) * step for i in range(n)]
+
+        dec = VideoDecoder(str(clip))
+        batch = dec.get_frames_played_at(stamps)
+        return batch.data          # (N, C, H, W) uint8
+
+    def annotate(self, clip: Path, start: float, end: float) -> str:
+        from PIL import Image
+
+        frames = self._frames(clip, start, end)
+        imgs = [Image.fromarray(f.permute(1, 2, 0).cpu().numpy()) for f in frames]
+
+        pixel_values = torch.stack([self.transform(im) for im in imgs])
+        pixel_values = pixel_values.to(torch.bfloat16).to(self.model.device)
+
+        # InternVL wants one <image> placeholder per frame, numbered. Without
+        # the Frame-N prefixes it treats the batch as unordered stills and
+        # loses the temporal ordering the whole task depends on.
+        prefix = "".join(f"Frame{i + 1}: <image>\n" for i in range(len(imgs)))
+        question = prefix + PROMPT
+
+        with torch.inference_mode():
+            out = self.model.chat(
+                self.tokenizer,
+                pixel_values,
+                question,
+                dict(max_new_tokens=self.args.max_new_tokens,
+                     do_sample=False,
+                     repetition_penalty=1.05),
+                num_patches_list=[1] * len(imgs),
+            )
+        return str(out).strip()
+
+
+BACKENDS = {"qwen": QwenAnnotator, "internvl": InternVLAnnotator}
 
 
 def hhmmss(seconds: float) -> str:
@@ -207,6 +445,13 @@ def parse_annotation(raw: str) -> dict:
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model", type=Path, default=DEFAULT_MODEL,
+                    help="local checkpoint dir under $ROOT/models")
+    ap.add_argument("--backend", choices=sorted(BACKENDS),
+                    help="override backend auto-detection")
+    ap.add_argument("--model-tag", default=None,
+                    help="short name used in the output filename and in every "
+                         "record (default: the checkpoint directory name)")
     ap.add_argument("--videos", type=Path, default=ROOT / "youtube_dataset/videos")
     ap.add_argument("--manifest", type=Path,
                     default=ROOT / "youtube_dataset/manifest.tsv")
@@ -233,10 +478,21 @@ def main():
     # included. Generation dominates per-segment cost, so this is also the
     # cheapest lever on total runtime.
     ap.add_argument("--max-new-tokens", type=int, default=256)
+    # Qwen only: whole-clip vision-token budget, ~= total_pixels / (32*32).
+    ap.add_argument("--total-pixels-factor", type=int, default=20480)
+    # InternVL only. 32 frames x 448px is already ~8k vision tokens; the cap
+    # stops a long tail window from quietly becoming an OOM.
+    ap.add_argument("--max-frames", type=int, default=32)
+    ap.add_argument("--internvl-tile", type=int, default=448)
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
         raise SystemExit("no GPU -- needs an A100 allocation, not a login node.")
+
+    if not args.model.is_dir():
+        raise SystemExit(f"no checkpoint at {args.model}")
+    model_tag = args.model_tag or args.model.name
+    backend = args.backend or detect_backend(args.model)
 
     # Stamped into every record. Two runs with different prompts are then
     # distinguishable after the fact, and --resume can tell fresh from stale.
@@ -251,17 +507,26 @@ def main():
         # Strict pattern: exactly 3 digits then the 8-hex prompt hash. A loose
         # \d+ also matches the DATE in old timestamp-named files
         # (annotations_20260714_...), which made the counter jump to 20260715.
+        #
+        # The model tag sits in the name so three models over one video give
+        # you three obviously-distinct files instead of three files whose only
+        # difference is a counter. The counter is scoped PER TAG, so each
+        # model numbers its own runs from 001.
+        pat = re.compile(rf"annotations_{re.escape(model_tag)}_(\d{{3}})_"
+                         rf"[0-9a-f]{{8}}\.jsonl$")
         nums = []
-        for f in args.outdir.glob("annotations_*.jsonl"):
-            m = re.match(r"annotations_(\d{3})_[0-9a-f]{8}\.jsonl$", f.name)
+        for f in args.outdir.glob(f"annotations_{model_tag}_*.jsonl"):
+            m = pat.match(f.name)
             if m:
                 nums.append(int(m.group(1)))
         run_no = (max(nums) + 1) if nums else 1
-        args.out = args.outdir / f"annotations_{run_no:03d}_{prompt_sha}.jsonl"
+        args.out = (args.outdir /
+                    f"annotations_{model_tag}_{run_no:03d}_{prompt_sha}.jsonl")
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
     meta = load_manifest(args.manifest)
     print(f"manifest: {len(meta)} videos", flush=True)
+    print(f"model:    {model_tag}  [backend={backend}]", flush=True)
     print(f"prompt:   {prompt_sha}", flush=True)
     print(f"writing:  {args.out}", flush=True)
 
@@ -283,7 +548,7 @@ def main():
     # and half another with nothing in the data to say which.
     done = set()
     if args.resume:
-        stale = 0
+        stale = other_model = 0
         for prev in sorted(args.outdir.glob("annotations_*.jsonl")):
             with prev.open() as f:
                 for line in f:
@@ -293,13 +558,20 @@ def main():
                         r = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    # A segment annotated by ANOTHER model is not this model's
+                    # work. Without this check, running three models over one
+                    # video gives you one full file and two nearly empty ones --
+                    # and no error to tell you the comparison is worthless.
+                    if r.get("model", LEGACY_MODEL_TAG) != model_tag:
+                        other_model += 1
+                        continue
                     if r.get("prompt_sha") != prompt_sha:
                         stale += 1
                         continue
                     if r.get("parse_ok"):   # retry anything that failed to parse
                         done.add((r["video_id"], r["segment_index"]))
-        print(f"resume:   {len(done)} done, {stale} stale (different prompt)",
-              flush=True)
+        print(f"resume:   {len(done)} done, {stale} stale (different prompt), "
+              f"{other_model} from other models (ignored)", flush=True)
 
     work, skipped = [], []
     for clip in clips:
@@ -323,12 +595,9 @@ def main():
     if not work:
         return
 
-    processor = AutoProcessor.from_pretrained(str(MODEL))
-    print("loading weights (~53GB off GPFS, ~1min)...", flush=True)
-    model = AutoModelForImageTextToText.from_pretrained(
-        str(MODEL), dtype=torch.bfloat16, device_map="cuda:0")
-    model.eval()
-    print(f"ready on {torch.cuda.get_device_name(0)}\n", flush=True)
+    annotator = BACKENDS[backend](args.model, args)
+    ngpu = torch.cuda.device_count()
+    print(f"ready on {ngpu} x {torch.cuda.get_device_name(0)}\n", flush=True)
 
     n = len(work)
     t_start = time.time()
@@ -336,50 +605,9 @@ def main():
 
     with args.out.open("a") as fout:
         for k, (clip, vid, title, url, i, start, end) in enumerate(work, 1):
-            msgs = [{
-                "role": "user",
-                "content": [
-                    # total_pixels is the real memory knob, not fps. If a clip
-                    # OOMs, lower total_pixels first -- you keep temporal
-                    # coverage and give up spatial detail, the better trade.
-                    {"type": "video", "video": str(clip), "fps": args.fps,
-                     "video_start": start, "video_end": end,
-                     "total_pixels": 20480 * 32 * 32},
-                    {"type": "text", "text": PROMPT},
-                ],
-            }]
             t0 = time.time()
             try:
-                images, videos, video_kwargs = process_vision_info(
-                    msgs, return_video_kwargs=True)
-
-                # fps comes back as a LIST (one per video in the batch) -- the
-                # processor validates it as a scalar. It feeds MRoPE's temporal
-                # positions, so use the ACTUAL sampled rate, not args.fps.
-                fps = video_kwargs.get("fps")
-                if isinstance(fps, (list, tuple)):
-                    fps = fps[0] if fps else args.fps
-
-                text = processor.apply_chat_template(
-                    msgs, tokenize=False, add_generation_prompt=True)
-                inputs = processor(
-                    text=[text],
-                    images=images if images else None,
-                    videos=videos,
-                    fps=fps,
-                    return_tensors="pt",
-                ).to(model.device)
-
-                with torch.inference_mode():
-                    out = model.generate(
-                        **inputs,
-                        max_new_tokens=args.max_new_tokens,
-                        do_sample=False,          # deterministic: this is extraction
-                        repetition_penalty=1.05,  # greedy decoding looped without it
-                    )
-                raw = processor.batch_decode(
-                    out[:, inputs["input_ids"].shape[1]:],
-                    skip_special_tokens=True)[0].strip()
+                raw = annotator.annotate(clip, start, end)
             except Exception as e:
                 print(f"[{k}/{n}] FAIL {vid} seg {i}: {e}", flush=True)
                 continue
@@ -391,6 +619,8 @@ def main():
                 bad += 1
 
             rec = {
+                "model": model_tag,
+                "backend": backend,
                 "prompt_sha": prompt_sha,
                 "video_id": vid,
                 "video_name": title,
