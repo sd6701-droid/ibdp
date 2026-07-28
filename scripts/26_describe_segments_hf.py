@@ -556,14 +556,25 @@ class QwenOmniAnnotator:
             with torch.inference_mode():
                 out = self.model.generate(
                     **inputs,
-                    max_new_tokens=self.args.max_new_tokens,
+                    # thinker_max_new_tokens, NOT max_new_tokens. Omni's
+                    # generate() seeds thinker_kwargs with its OWN default of
+                    # 1024 and then merges extra kwargs only `if key not in
+                    # thinker_kwargs` -- so a plain max_new_tokens is silently
+                    # DISCARDED. That is a 4x longer generation than every
+                    # other backend, and the rambling this prompt was designed
+                    # to stop, with nothing in the output to say why.
+                    thinker_max_new_tokens=self.args.max_new_tokens,
+                    # These two have no thinker_ default, so they fall through
+                    # shared_kwargs into the thinker as-is.
                     do_sample=False,
                     repetition_penalty=1.05,
                     use_audio_in_video=True,
                     return_audio=False,     # text out; no speech synthesis
                 )
+            # generate() ALWAYS returns (thinker_result, None) when it is not
+            # synthesising audio -- a tuple even with the talker deleted.
             if isinstance(out, (tuple, list)):
-                out = out[0]                # (text_ids, audio) when talker lives
+                out = out[0]
             return self.processor.batch_decode(
                 out[:, inputs["input_ids"].shape[1]:],
                 skip_special_tokens=True)[0].strip()
@@ -716,7 +727,11 @@ def init_wandb(args, model_tag, backend, prompt_sha, videos, n_segments):
 
     Runs are GROUPED BY VIDEO and named by model, so the three models over one
     video land in one comparable group in the W&B UI instead of three unrelated
-    runs you have to eyeball side by side."""
+    runs you have to eyeball side by side.
+
+    The run NAME carries the audio mode too: the same model over the same video
+    with and without audio is otherwise two runs with one name, which is the
+    one pair you most need to tell apart."""
     if not args.wandb:
         return None
     try:
@@ -732,12 +747,20 @@ def init_wandb(args, model_tag, backend, prompt_sha, videos, n_segments):
     # hours is not something to point at a small quota.
     os.environ.setdefault("WANDB_DIR", str(args.outdir))
 
+    # "native" for a model that hears the waveform, "transcript" for one fed
+    # Whisper text, "none" for video only. Three modes, not a bool, because
+    # Omni-with-audio and Qwen-VL-with-a-transcript are not the same treatment.
+    audio_mode = ("native" if backend == "qwen-omni"
+                  else "transcript" if args.transcribe
+                  else "none")
+
     group = videos[0] if len(videos) == 1 else f"{len(videos)}-videos"
+    suffix = "" if audio_mode == "none" else f"--{audio_mode}"
     run = wandb.init(
         project=args.wandb_project,
-        name=f"{model_tag}--{group}",
+        name=f"{model_tag}--{group}{suffix}",
         group=group,
-        job_type=model_tag,
+        job_type=f"{model_tag}[{audio_mode}]",
         config={
             "model": model_tag,
             "backend": backend,
@@ -745,10 +768,18 @@ def init_wandb(args, model_tag, backend, prompt_sha, videos, n_segments):
             "videos": videos,
             "n_segments": n_segments,
             "window_sec": args.seconds,
+            "min_tail_sec": args.min_tail,     # also moves segment boundaries
             "fps": args.fps,
             "max_new_tokens": args.max_new_tokens,
             "total_pixels_factor": args.total_pixels_factor,
             "max_frames": args.max_frames,
+            # THE AUDIO AXIS. Without these, an audio run and a video-only run
+            # are distinguishable in the UI only by a changed prompt_sha -- a
+            # hex string -- which is useless for grouping or filtering the one
+            # comparison this whole thing exists to make.
+            "audio_mode": audio_mode,
+            "asr_model": (args.asr_model.name if args.transcribe else None),
+            "language": (args.language if args.transcribe else None),
             "n_gpus": torch.cuda.device_count(),
             "gpu": torch.cuda.get_device_name(0),
         },
@@ -912,7 +943,7 @@ def main():
     ap.add_argument("--internvl-tile", type=int, default=448)
     ap.add_argument("--wandb", action="store_true",
                     help="log GPU usage + per-segment metrics to Weights & Biases")
-    ap.add_argument("--wandb-project", default="ibdp-annotation")
+    ap.add_argument("--wandb-project", default="ibdp")
     ap.add_argument("--wandb-mode", default="offline",
                     choices=["offline", "online", "disabled"],
                     help="offline is the default: compute nodes have no "
