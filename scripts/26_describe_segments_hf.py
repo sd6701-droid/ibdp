@@ -586,11 +586,22 @@ class QwenOmniAnnotator:
             # disagree and it fails deep inside the model with a shape error.
             audios, images, videos = self._process_mm_info(
                 msgs, use_audio_in_video=True)
+            # dtype=, not just device=. The audio feature extractor emits
+            # float32 mel features, but the audio tower's weights are bf16, and
+            # a bare .to(device) moves them without converting:
+            #   Input type (float) and bias type (c10::BFloat16) should be the
+            #   same
+            # -- raised on the tower's first Conv1d, so EVERY segment fails and
+            # none of them fail for a reason that mentions audio.
+            #
+            # BatchFeature.to() applies a dtype only to floating-point tensors
+            # and merely moves the rest, so input_ids stays Long. That is why
+            # this can be a blanket cast rather than a per-key one.
             inputs = self.processor(
                 text=[text], audio=audios, images=images, videos=videos,
                 return_tensors="pt", padding=True,
                 use_audio_in_video=True,
-            ).to(self.model.device)
+            ).to(device=self.model.device, dtype=self.model.dtype)
 
             with torch.inference_mode():
                 out = self.model.generate(
