@@ -524,14 +524,38 @@ class QwenOmniAnnotator:
         self.args = args
         self._process_mm_info = process_mm_info
         self.processor = AutoProcessor.from_pretrained(str(model_dir))
+
+        # enable_audio_output=False at LOAD time, not disable_talker() after.
+        #
+        # The talker synthesises SPEECH; we want JSON, so it is pure cost. But
+        # the order matters for more than memory: built first and deleted
+        # after, it is still present while accelerate computes the device map,
+        # so "auto" spreads the thinker across every card to make room for
+        # weights that are about to be thrown away. The thinker's towers then
+        # sit on different GPUs than its text model and every segment dies
+        # with:
+        #   Expected all tensors to be on the same device, but found at least
+        #   two devices, cuda:0 and cuda:1!
+        # Never building it keeps the thinker whole.
+        #
+        # Talker-less, this is ~62GB in bf16, which fits one 80GB A100 with
+        # room for activations -- so pin it to ONE card and the entire class of
+        # cross-device bug cannot occur. Fall back to sharding only if the
+        # cards are too small to hold it.
+        free, total = torch.cuda.mem_get_info(0)
+        single_card = total / 1e9 > 75
+
         self.model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
-            str(model_dir), dtype="auto", device_map="auto",
+            str(model_dir),
+            dtype="auto",
+            device_map={"": 0} if single_card else "auto",
+            enable_audio_output=False,
             attn_implementation="sdpa")
-        # The talker synthesises SPEECH. We want JSON. Keeping it loaded costs
-        # several GB of VRAM to generate audio nothing ever reads.
-        if hasattr(self.model, "disable_talker"):
-            self.model.disable_talker()
         self.model.eval()
+        if getattr(self.model, "has_talker", False):
+            # Belt and braces: if a future config ignores the kwarg, drop it
+            # rather than silently paying for it.
+            self.model.disable_talker()
 
         self._tmp = Path(tempfile.mkdtemp(prefix="omni_seg_"))
         # Segments are unlinked as they are used; this clears the directory
