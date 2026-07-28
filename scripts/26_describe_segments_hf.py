@@ -618,9 +618,16 @@ def main():
             else:
                 bad += 1
 
+            # Measured here, before the record is written, so every annotation
+            # carries what it cost. Comparing models is not only about whether
+            # they agree -- a 78B that is 4x slower for the same counts is not
+            # worth the four GPUs, and without this the comparison cannot say so.
+            dt = time.time() - t0
+
             rec = {
                 "model": model_tag,
                 "backend": backend,
+                "elapsed_sec": round(dt, 2),
                 "prompt_sha": prompt_sha,
                 "video_id": vid,
                 "video_name": title,
@@ -638,7 +645,6 @@ def main():
             fout.write(json.dumps(rec) + "\n")
             fout.flush()   # survive a walltime kill
 
-            dt = time.time() - t0
             rate = (time.time() - t_start) / max(ok + bad, 1)
             if ann["parse_ok"]:
                 flag = " INCONSISTENT" if ann["inconsistent"] else ""
