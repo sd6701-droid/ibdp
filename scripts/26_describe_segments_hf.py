@@ -568,6 +568,7 @@ class QwenOmniAnnotator:
             self.model.disable_talker()
 
         self._tmp = Path(tempfile.mkdtemp(prefix="omni_seg_"))
+        self._limits: dict[str, float] = {}   # clip -> decodable length
         # Segments are unlinked as they are used; this clears the directory
         # itself, including anything left by a segment that raised mid-cut.
         atexit.register(shutil.rmtree, self._tmp, True)
@@ -598,10 +599,75 @@ class QwenOmniAnnotator:
         if p.returncode != 0 or not dst.exists():
             raise RuntimeError(f"ffmpeg could not cut {clip.name} "
                                f"[{start:.2f},{end:.2f}]: {p.stderr.strip()}")
+
+        # VERIFY BEFORE HANDING IT TO THE DECODER.
+        #
+        # ffmpeg exits 0 on a window past the end of the stream and writes a
+        # valid container with no frames in it. qwen_omni_utils then feeds that
+        # to a native audio decoder which does not check, and the process
+        # SEGFAULTS -- taking every remaining segment with it. Raising here
+        # turns a run-ending crash into one logged FAIL line.
+        q = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "format=duration:stream=codec_type", "-of", "csv=p=0", str(dst)],
+            capture_output=True, text=True)
+        fields = [x.strip() for x in q.stdout.split() if x.strip()]
+        dur = None
+        for f in fields:
+            try:
+                dur = float(f)
+            except ValueError:
+                continue
+        if dur is None or dur < 0.05:
+            dst.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"cut of {clip.name} [{start:.2f},{end:.2f}] is empty "
+                f"(duration={dur}) -- window is past the end of the stream.")
+        if "audio" not in q.stdout:
+            dst.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"cut of {clip.name} [{start:.2f},{end:.2f}] has no audio "
+                f"stream; this backend exists to hear it.")
         return dst
+
+    def _limit(self, clip: Path) -> float | None:
+        """Decodable length of clip, seconds. Cached: one ffprobe per video,
+        not per segment."""
+        key = str(clip)
+        if key not in self._limits:
+            p = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", str(clip)], capture_output=True, text=True)
+            val = p.stdout.strip()
+            try:
+                self._limits[key] = float(val) if val and val != "N/A" else None
+            except ValueError:
+                self._limits[key] = None
+        return self._limits[key]
 
     def annotate(self, clip: Path, start: float, end: float,
                  prompt: str = PROMPT) -> str:
+        # CLAMP TO THE REAL STREAM -- the same correction _frames() makes for
+        # InternVL, and for the same reason: segment bounds come from the
+        # manifest, which is yt-dlp container metadata and routinely overshoots
+        # the decodable file.
+        #
+        # It matters MORE here. InternVL got a clean torchcodec error. This
+        # backend hands the out-of-range window to ffmpeg, which cheerfully
+        # writes a zero-length clip, and the native audio decoder then
+        # SEGFAULTS on it -- killing the whole process and every segment still
+        # queued behind it. A run that should lose one segment loses the rest
+        # of the video, and the traceback names neither audio nor the segment.
+        limit = self._limit(clip)
+        if limit is not None:
+            end = min(end, limit - 1e-3)
+            start = min(start, end - 1e-3)
+        if end <= start:
+            raise ValueError(
+                f"window [{start:.2f},{end:.2f}] is empty after clamping to "
+                f"the stream ({limit}) -- the manifest duration overshoots "
+                f"the file.")
+
         seg = self._cut(clip, start, end)
         try:
             msgs = [{
@@ -875,6 +941,64 @@ def init_wandb(args, model_tag, backend, prompt_sha, videos, n_segments):
     return run
 
 
+def table_columns(audio: bool) -> list:
+    """Columns for the per-segment results table. Audio columns only when the
+    model heard the clip -- an empty audio column on a video-only run reads as
+    "heard nothing", the same trap as a null field in the JSONL."""
+    cols = ["segment", "timestamp", "url_at", "parse_ok",
+            "num_infants", "num_children", "num_adults", "num_humans_total",
+            "infant_visibility", "visible_parts", "inconsistent",
+            "description"]
+    if audio:
+        cols += ["audio_events", "infant_vocalising", "speech_present",
+                 "audio_inconsistent", "audio_description"]
+    cols += ["elapsed_sec"]
+    return cols
+
+
+def table_row(rec: dict, ann: dict, audio: bool) -> list:
+    """One row, ordered to match table_columns(). Lists are joined to strings:
+    W&B renders a Python list as its repr, which is unreadable in a cell and
+    cannot be filtered on."""
+    row = [rec["segment_index"], rec["timestamp"], rec["url_at"],
+           bool(ann.get("parse_ok")),
+           ann.get("num_infants"), ann.get("num_children"),
+           ann.get("num_adults"), ann.get("num_humans_total"),
+           ann.get("infant_visibility"),
+           ", ".join(ann.get("visible_infant_parts") or []),
+           bool(ann.get("inconsistent")),
+           # Unparseable segments keep their raw text -- that is the only place
+           # you can see WHY they failed, and truncation is invisible in a
+           # parse_ok=false flag alone.
+           ann.get("description") or (ann.get("raw") or "")[:500]]
+    if audio:
+        row += [", ".join(ann.get("audio_events") or []),
+                bool(ann.get("infant_vocalising")),
+                bool(ann.get("speech_present")),
+                bool(ann.get("audio_inconsistent")),
+                ann.get("audio_description") or ""]
+    row += [rec["elapsed_sec"]]
+    return row
+
+
+def log_table(run, rows: list, audio: bool):
+    """Log the accumulated rows as a fresh wandb.Table.
+
+    REBUILT each time rather than mutating one long-lived Table: W&B treats a
+    logged Table as immutable and adding rows to one that has already been
+    logged either warns or silently drops the additions.
+
+    Called periodically, NOT only at the end -- this job dies to walltime kills
+    and, as of the last run, a segfault on the final segment. A table logged
+    only on clean exit is a table you never get for the runs you most want to
+    inspect.
+    """
+    if run is None:
+        return
+    import wandb
+    run.log({"results": wandb.Table(columns=table_columns(audio), data=rows)})
+
+
 def hhmmss(seconds: float) -> str:
     s = int(seconds)
     return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
@@ -1062,6 +1186,9 @@ def main():
     ap.add_argument("--wandb", action="store_true",
                     help="log GPU usage + per-segment metrics to Weights & Biases")
     ap.add_argument("--wandb-project", default="ibdp")
+    ap.add_argument("--wandb-table-every", type=int, default=10,
+                    help="re-log the results table every N segments, so a "
+                         "killed run still has its results in the UI.")
     ap.add_argument("--wandb-mode", default="offline",
                     choices=["offline", "online", "disabled"],
                     help="offline is the default: compute nodes have no "
@@ -1213,6 +1340,7 @@ def main():
     n = len(work)
     t_start = time.time()
     ok = bad = 0
+    table_rows = []
 
     with args.out.open("a") as fout:
         for k, (clip, vid, title, url, i, start, end) in enumerate(work, 1):
@@ -1305,6 +1433,12 @@ def main():
                         "ann/inconsistent": int(ann["inconsistent"]),
                     })
                 run.log(metrics, step=k)
+                table_rows.append(table_row(rec, ann, native_audio))
+                # Periodic, so a killed run still has most of its results in
+                # the UI. Every row is already safe in the JSONL; this is about
+                # being able to READ them without sshing in.
+                if k % args.wandb_table_every == 0:
+                    log_table(run, table_rows, native_audio)
             if ann["parse_ok"]:
                 flag = " INCONSISTENT" if ann["inconsistent"] else ""
                 summary = (f"infant={ann['num_infants']} adult={ann['num_adults']} "
@@ -1330,6 +1464,8 @@ def main():
             "sec_per_segment": total / max(ok + bad, 1),
             "output_file": args.out.name,
         })
+        # Final flush: the last partial block since the periodic log.
+        log_table(run, table_rows, native_audio)
         run.finish()
         # Offline runs are inert until synced, and a run nobody syncs is a run
         # nobody sees. Print the exact command rather than leaving it to be
