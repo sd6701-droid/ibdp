@@ -68,4 +68,7 @@ mkdir -p /gpfs/scratch/sd6701/personal/ibdp/datasets/_logs
 # The script does its own 10s connectivity preflight and exits 1 with a clear
 # message on a firewalled node, so a misrouted job dies in seconds rather than
 # hanging for the full walltime. "$@" forwards --only / --dry-run from sbatch.
-srun scripts/12_fetch_datasets.sh "$@"
+# NOT under srun -- data_mover hands out a restricted CPU mask that srun cannot
+# re-bind to, and the step dies with "Unable to satisfy cpu bind request" before
+# the script runs. One task, one node: srun was pure downside here.
+scripts/12_fetch_datasets.sh "$@"

@@ -130,6 +130,45 @@ Sort EVERY visible person into exactly one bucket; omit nobody:
 VALID_VISIBILITY = {"full_body", "partial_body", "not_visible"}
 VALID_PARTS = {"head", "face", "torso", "arms", "hands", "legs", "feet"}
 
+# ---------------------------------------------------------------------------
+# Audio addendum -- ONLY for a model that actually hears the clip (qwen-omni).
+#
+# Kept OUT of PROMPT deliberately. Asking a video-only model what it hears gets
+# you a confident answer invented from the pixels, which is worse than no
+# answer because nothing in the output marks it as a guess. It would also
+# change prompt_sha for all four existing models and strand the current corpus.
+#
+# The event vocabulary is CLOSED for the same reason "infant" is defined in
+# PROMPT: left open, the model drifts across "baby noise", "cooing", "babble"
+# and "vocalisation" between segments, and the labels stop aggregating.
+AUDIO_EVENTS = ["infant_vocalisation", "infant_crying", "infant_laughing",
+                "adult_speech", "child_speech", "singing", "music",
+                "tv_or_device", "household_noise", "outdoor_noise", "silence"]
+
+VALID_AUDIO_EVENTS = set(AUDIO_EVENTS)
+
+AUDIO_PROMPT = """
+
+You can HEAR this clip as well as see it. Add these keys to the same JSON
+object:
+
+  "audio_events": [%s],
+  "infant_vocalising": bool,
+  "speech_present": bool,
+  "audio_description": "at most 1 sentence"
+
+- audio_events: every category actually AUDIBLE. [] if there is no sound at
+  all; use "silence" only when the clip has an audio track that is silent.
+- Judge sound by EAR, not by what the picture implies. A visibly crying infant
+  with no audible cry is not "infant_crying".
+- infant_vocalising covers any infant sound -- cry, babble, laugh, grunt.
+- speech_present: any intelligible human speech, including a narrator or
+  someone off-camera.
+- audio_description: one sentence on what is heard. If narration comes from
+  someone not visible, say so.
+- Do NOT let the audio change your visual counts. Someone you only hear is not
+  a visible person.""" % ", ".join(f'"{e}"' for e in AUDIO_EVENTS)
+
 
 # ---------------------------------------------------------------------------
 # Backends
@@ -826,10 +865,16 @@ def segments(duration: float, window: float, min_tail: float):
     return out
 
 
-def parse_annotation(raw: str) -> dict:
+def parse_annotation(raw: str, audio: bool = False) -> dict:
     """Model text -> validated dict. Never raises: a segment that returns junk
     records parse_ok=false and keeps its raw text, rather than killing the run or
-    silently writing zeros that look like real observations."""
+    silently writing zeros that look like real observations.
+
+    audio=True adds the AUDIO_PROMPT keys. The fields are absent rather than
+    null for a video-only run: a null "infant_vocalising" on a model that
+    cannot hear reads like a heard-nothing observation, and would be counted as
+    one by anything aggregating later.
+    """
     out = {"parse_ok": False, "raw": raw}
 
     # It is told not to fence the JSON, but it sometimes does anyway.
@@ -886,6 +931,34 @@ def parse_annotation(raw: str) -> dict:
         or (not ann["has_infant"] and ann["visible_infant_parts"])
         or ann["num_humans_total"] != parts_sum
     )
+
+    if audio:
+        events = d.get("audio_events") or []
+        if not isinstance(events, list):
+            events = []
+        # Unknown labels are DROPPED, not kept: a free-text event that appears
+        # in one segment and never again is noise in every aggregate, and
+        # keeping it would defeat the point of a closed vocabulary.
+        events = [e for e in (str(x).strip().lower() for x in events)
+                  if e in VALID_AUDIO_EVENTS]
+        ann["audio_events"] = events
+        ann["infant_vocalising"] = as_bool(d.get("infant_vocalising"))
+        ann["speech_present"] = as_bool(d.get("speech_present"))
+        ann["audio_description"] = str(d.get("audio_description", "")).strip()
+
+        # Same treatment as the visual counts: flag the disagreement, never
+        # silently repair it. "silence" alongside real events, or a claim of
+        # infant vocalisation with no infant sound in the event list, means the
+        # segment should be looked at rather than quietly trusted.
+        infant_sounds = {"infant_vocalisation", "infant_crying",
+                         "infant_laughing"}
+        speech_sounds = {"adult_speech", "child_speech"}
+        ann["audio_inconsistent"] = bool(
+            ("silence" in events and len(events) > 1)
+            or (ann["infant_vocalising"] and not (infant_sounds & set(events)))
+            or (ann["speech_present"] and not (speech_sounds & set(events)))
+        )
+
     ann["parse_ok"] = True
     return ann
 
@@ -965,8 +1038,14 @@ def main():
     # video-only run produce records that are indistinguishable, and --resume
     # would treat the older ones as already done -- leaving a corpus that is
     # half one modality and half the other with nothing in the data to say so.
+    # AUDIO_PROMPT likewise: an Omni run that reports what it heard asks a
+    # strictly larger question than one that does not, so the two must not
+    # resume into each other either.
+    native_audio = backend == "qwen-omni"
     prompt_sha = hashlib.sha256(
-        (PROMPT + (TRANSCRIPT_TEMPLATE if args.transcribe else "")).encode()
+        (PROMPT
+         + (TRANSCRIPT_TEMPLATE if args.transcribe else "")
+         + (AUDIO_PROMPT if native_audio else "")).encode()
     ).hexdigest()[:8]
 
     args.outdir.mkdir(parents=True, exist_ok=True)
@@ -1097,11 +1176,12 @@ def main():
             # Transcription is timed INSIDE the segment, but the cache means
             # only the first segment of each video actually pays for it.
             transcript = None
-            prompt = PROMPT
+            # A model that hears the clip is asked to report what it heard.
+            prompt = PROMPT + (AUDIO_PROMPT if native_audio else "")
             if asr is not None:
                 try:
                     transcript = asr.segment_text(clip, start, end)
-                    prompt = PROMPT + TRANSCRIPT_TEMPLATE.format(
+                    prompt = prompt + TRANSCRIPT_TEMPLATE.format(
                         transcript=transcript)
                 except Exception as e:
                     # Falling back to video-only is correct, but it must be
@@ -1116,7 +1196,7 @@ def main():
                 print(f"[{k}/{n}] FAIL {vid} seg {i}: {e}", flush=True)
                 continue
 
-            ann = parse_annotation(raw)
+            ann = parse_annotation(raw, audio=native_audio)
             if ann["parse_ok"]:
                 ok += 1
             else:

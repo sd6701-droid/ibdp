@@ -60,4 +60,12 @@ mkdir -p /gpfs/scratch/sd6701/personal/ibdp/models/_logs
 # The script preflights connectivity, the hf CLI and free disk, exiting fast
 # with a clear message on any of them -- so a misrouted job dies in seconds
 # rather than burning 12h of walltime. "$@" forwards --only / --dry-run.
-srun scripts/13_fetch_models.sh "$@"
+#
+# RUN DIRECTLY, NOT UNDER srun. data_mover nodes hand the job a restricted CPU
+# mask, and srun then tries to re-bind to it and dies before the script starts:
+#   srun: error: CPU binding outside of job step allocation, allocated CPUs
+#         are: 0x0000003802
+#   srun: error: Unable to satisfy cpu bind request
+# The job "succeeds" in the sense that sbatch returns, and nothing downloads.
+# This is one task on one node -- srun added a failure mode and no capability.
+scripts/13_fetch_models.sh "$@"
