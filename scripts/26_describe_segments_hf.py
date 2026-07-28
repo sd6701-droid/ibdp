@@ -243,6 +243,73 @@ class InternVLAnnotator:
     IMAGENET_STD = (0.229, 0.224, 0.225)
 
     @staticmethod
+    def _split_model(model_dir: Path):
+        """Explicit layer -> GPU map, mirroring InternVL's own split_model().
+
+        NOT device_map="auto", for a hard reason: "auto" routes through
+        transformers' infer_auto_device_map, which reads
+        model.all_tied_weights_keys. That attribute is populated by
+        PreTrainedModel.post_init(), and InternVL's vendored __init__ never
+        calls post_init -- so on transformers 4.5x it is an AttributeError
+        before a single weight loads. An explicit dict skips that path entirely.
+
+        The placement also matters on its own terms: the vision tower, the
+        embeddings, the final norm and lm_head all sit on GPU 0, and GPU 0 takes
+        roughly half a share of decoder layers to pay for carrying the ViT.
+        """
+        import math
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=True)
+        llm_cfg = getattr(cfg, "llm_config", None) or getattr(cfg, "text_config", None)
+        if llm_cfg is None:
+            raise SystemExit(
+                f"{model_dir.name}: config has neither llm_config nor "
+                f"text_config; cannot place layers. Try --backend qwen if this "
+                f"is not actually an InternVL checkpoint.")
+        num_layers = llm_cfg.num_hidden_layers
+        world = torch.cuda.device_count()
+
+        per = math.ceil(num_layers / (world - 0.5))
+        counts = [per] * world
+        counts[0] = math.ceil(per * 0.5)
+
+        device_map, layer = {}, 0
+        for gpu, n in enumerate(counts):
+            for _ in range(n):
+                if layer >= num_layers:
+                    break
+                device_map[f"language_model.model.layers.{layer}"] = gpu
+                layer += 1
+
+        # Everything non-decoder on GPU 0, including the LAST layer: it feeds
+        # the norm and lm_head, and splitting them costs a device hop per token.
+        for k in ("vision_model", "mlp1",
+                  "language_model.model.tok_embeddings",
+                  "language_model.model.embed_tokens",
+                  "language_model.model.norm",
+                  "language_model.model.rotary_emb",
+                  "language_model.output",
+                  "language_model.lm_head"):
+            device_map[k] = 0
+        device_map[f"language_model.model.layers.{num_layers - 1}"] = 0
+        return device_map
+
+    @staticmethod
+    def _patch_tied_weights():
+        """transformers 4.5x reads all_tied_weights_keys in several load paths,
+        not only the device-map one. post_init() sets it; InternVL's vendored
+        __init__ skips post_init, so give the base class a default.
+
+        A plain CLASS ATTRIBUTE, deliberately not a property: any model that
+        does set its own instance value must still shadow this, and a read-only
+        property would break that assignment for every other model in the
+        process."""
+        from transformers import PreTrainedModel
+        if not hasattr(PreTrainedModel, "all_tied_weights_keys"):
+            PreTrainedModel.all_tied_weights_keys = {}
+
+    @staticmethod
     def _check_deps(model_dir: Path):
         """Fail here, legibly, rather than 40 frames into a traceback from
         inside transformers' dynamic module loader.
@@ -277,6 +344,7 @@ class InternVLAnnotator:
         from transformers import AutoModel, AutoTokenizer
 
         self._check_deps(model_dir)
+        self._patch_tied_weights()
         self.args = args
         self.tokenizer = AutoTokenizer.from_pretrained(
             str(model_dir), trust_remote_code=True, use_fast=False)
@@ -285,9 +353,15 @@ class InternVLAnnotator:
         # trust_remote_code: InternVL ships its own modelling code, including
         # the .chat() helper used below. AutoModelForImageTextToText does not
         # cover it.
+        #
+        # device_map is an explicit dict on multi-GPU (see _split_model) and a
+        # plain {"": 0} on one card. Neither is the string "auto", which is what
+        # triggers infer_auto_device_map and the all_tied_weights_keys crash.
+        device_map = (self._split_model(model_dir)
+                      if torch.cuda.device_count() > 1 else {"": 0})
         self.model = AutoModel.from_pretrained(
             str(model_dir), dtype=torch.bfloat16, trust_remote_code=True,
-            low_cpu_mem_usage=True, device_map=_device_map()).eval()
+            low_cpu_mem_usage=True, device_map=device_map).eval()
 
         size = args.internvl_tile
         self.transform = T.Compose([
