@@ -1756,6 +1756,20 @@ def main():
                 # not RENUMBER every later split when --clip-max-sec changes
                 # -- a sequential counter fails (c), and with it every
                 # already-annotated segment's resume key.
+                # OMNI SKIPS OVER-LONG CLIPS OUTRIGHT rather than windowing
+                # them. Windowing means _cut(): an ffmpeg re-encode of an
+                # already re-encoded split, and that second-generation file is
+                # exactly where the native audio decoder segfaulted (seg 602,
+                # twice, two nodes). Skipping keeps Omni on pristine
+                # once-encoded files only. The video-only models still window
+                # long splits -- their decode path is not the fragile one --
+                # so those records exist; Omni simply has no row there, which
+                # 27 renders as "-" rather than an error.
+                if native_audio and dur > args.clip_max_sec:
+                    skipped.append(f"{vid}/{sd.name} ({dur:.0f}s > "
+                                   f"{args.clip_max_sec:.0f}s; omni skips "
+                                   f"long clips)")
+                    continue
                 if dur <= args.clip_max_sec:
                     if (vid, i * 100) in done:
                         continue
