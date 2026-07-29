@@ -103,7 +103,9 @@ def main():
     ap.add_argument("--wandb", action="store_true",
                     help="log the comparison to W&B, in the same group as the "
                          "per-model runs")
-    ap.add_argument("--wandb-project", default="ibdp-annotation")
+    # Must match scripts/26's default, or the comparison lands in a different
+    # W&B project than the runs it compares and looks like it never logged.
+    ap.add_argument("--wandb-project", default="ibdp")
     ap.add_argument("--wandb-mode", default="offline",
                     choices=["offline", "online", "disabled"])
     ap.add_argument("--wandb-dir", type=Path, default=None,

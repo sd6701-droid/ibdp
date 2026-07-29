@@ -79,6 +79,26 @@ VIDEO="${1:-}"
 shift 2>/dev/null || true
 EXTRA=("$@")              # everything else is forwarded to the python script
 
+# --- W&B: tables only -------------------------------------------------------
+# WANDB_TABLES_ONLY=1 gives you ONE W&B run containing ONLY tables -- the
+# combined all_models table (model as the first column, one row per model x
+# segment), health, agreement, and the wide per-segment view. No charts.
+#
+# How: the annotator is what logs per-segment metrics (the charts), so --wandb
+# is STRIPPED from what the models see, and the comparison step is forced to
+# log instead. The models run clean; the one compare run carries the tables.
+#
+# Costs the GPU-utilisation charts too -- they come from the same per-model
+# runs. Want both? Use --wandb WITHOUT this switch and ignore the charts.
+WANDB_TABLES_ONLY="${WANDB_TABLES_ONLY:-0}"
+if [[ "$WANDB_TABLES_ONLY" == "1" ]]; then
+  declare -a _KEEP=()
+  for a in "${EXTRA[@]:-}"; do
+    [[ "$a" == "--wandb" ]] || _KEEP+=("$a")
+  done
+  EXTRA=("${_KEEP[@]:-}")
+fi
+
 [[ -n "$VIDEO" ]] || {
   echo "usage: $0 <video_id> [extra args forwarded to 26_describe_segments_hf.py]" >&2
   echo "       e.g. $0 0HkcGRBsPUM --seconds 10 --max-new-tokens 256" >&2
@@ -327,6 +347,9 @@ declare -a CMP_WANDB=()
 for a in "${EXTRA[@]:-}"; do
   [[ "$a" == "--wandb" ]] && CMP_WANDB=(--wandb)
 done
+# Tables-only mode stripped --wandb from EXTRA above, so force the compare
+# step's logging here -- it is the only thing that logs in that mode.
+[[ "$WANDB_TABLES_ONLY" == "1" ]] && CMP_WANDB=(--wandb)
 
 python scripts/27_compare_models.py \
     --outdir "$OUTDIR" --video "$VIDEO" --models "$joined" --csv "$csv" \
