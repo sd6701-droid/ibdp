@@ -564,6 +564,11 @@ class QwenOmniAnnotator:
 
         self.args = args
         self._process_mm_info = process_mm_info
+        # Counts segments where the audio path produced NaN and the video-only
+        # retry rescued the answer. Reported at the end: if it is most of the
+        # video, the audio pipeline is broken and the "does hearing help"
+        # comparison is not measuring what it claims.
+        self.audio_dropped = 0
         self.processor = AutoProcessor.from_pretrained(str(model_dir))
 
         # enable_audio_output=False at LOAD time, not disable_talker() after.
@@ -705,68 +710,98 @@ class QwenOmniAnnotator:
 
         seg = self._cut(clip, start, end)
         try:
-            msgs = [{
-                "role": "user",
-                "content": [
-                    {"type": "video", "video": str(seg),
-                     "fps": self.args.fps,
-                     "total_pixels": self.args.total_pixels_factor * 32 * 32},
-                    {"type": "text", "text": prompt},
-                ],
-            }]
-            text = self.processor.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True)
-            # use_audio_in_video MUST match between process_mm_info and the
-            # processor call. Mismatched, the audio and video token counts
-            # disagree and it fails deep inside the model with a shape error.
-            audios, images, videos = self._process_mm_info(
-                msgs, use_audio_in_video=True)
-            # dtype=, not just device=. The audio feature extractor emits
-            # float32 mel features, but the audio tower's weights are bf16, and
-            # a bare .to(device) moves them without converting:
-            #   Input type (float) and bias type (c10::BFloat16) should be the
-            #   same
-            # -- raised on the tower's first Conv1d, so EVERY segment fails and
-            # none of them fail for a reason that mentions audio.
-            #
-            # BatchFeature.to() applies a dtype only to floating-point tensors
-            # and merely moves the rest, so input_ids stays Long. That is why
-            # this can be a blanket cast rather than a per-key one.
-            inputs = self.processor(
-                text=[text], audio=audios, images=images, videos=videos,
-                return_tensors="pt", padding=True,
-                use_audio_in_video=True,
-            ).to(device=self.model.device, dtype=self.model.dtype)
+            raw = self._generate(seg, prompt, use_audio=True)
 
-            with torch.inference_mode():
-                out = self.model.generate(
-                    **inputs,
-                    # thinker_max_new_tokens, NOT max_new_tokens. Omni's
-                    # generate() seeds thinker_kwargs with its OWN default of
-                    # 1024 and then merges extra kwargs only `if key not in
-                    # thinker_kwargs` -- so a plain max_new_tokens is silently
-                    # DISCARDED. That is a 4x longer generation than every
-                    # other backend, and the rambling this prompt was designed
-                    # to stop, with nothing in the output to say why.
-                    thinker_max_new_tokens=self.args.max_new_tokens,
-                    # These two have no thinker_ default, so they fall through
-                    # shared_kwargs into the thinker as-is.
-                    do_sample=False,
-                    repetition_penalty=1.05,
-                    use_audio_in_video=True,
-                    return_audio=False,     # text out; no speech synthesis
-                )
-            # generate() ALWAYS returns (thinker_result, None) when it is not
-            # synthesising audio -- a tuple even with the talker deleted.
-            if isinstance(out, (tuple, list)):
-                out = out[0]
-            return self.processor.batch_decode(
-                out[:, inputs["input_ids"].shape[1]:],
-                skip_special_tokens=True)[0].strip()
+            # NaN RECOVERY. '!!!!!!' is token 0 repeated, which is argmax over
+            # all-NaN logits. The NaN originates in the audio path: a silent or
+            # near-silent window makes the mel features -inf, and casting those
+            # to bf16 for the audio tower carries the -inf straight into the
+            # forward pass. It arrives in contiguous blocks -- quiet passages of
+            # the video -- which is exactly what segments 5-13 of 8yDn1uFbs4s
+            # were.
+            #
+            # Retrying WITHOUT audio recovers the visual answer instead of
+            # losing the segment entirely. The record says audio was dropped, so
+            # a partial answer is never mistaken for a heard one. If it is still
+            # degenerate the cause is not audio, and --attn-impl eager is the
+            # next thing to try.
+            if is_degenerate(raw):
+                print("      degenerate (NaN) with audio -- retrying "
+                      "video-only", flush=True)
+                retry = self._generate(seg, prompt, use_audio=False)
+                if not is_degenerate(retry):
+                    self.audio_dropped += 1
+                    return retry
+            return raw
         finally:
             # Per segment, not per run: a 500s video at 10s windows would
             # otherwise leave 50 re-encoded mp4s in $TMPDIR.
             seg.unlink(missing_ok=True)
+
+    def _generate(self, seg: Path, prompt: str, use_audio: bool) -> str:
+        """One forward pass over an already-cut segment.
+
+        use_audio threads through BOTH process_mm_info and the processor call:
+        they must agree, or the audio and video token counts disagree and it
+        fails deep inside the model with a shape error."""
+        msgs = [{
+            "role": "user",
+            "content": [
+                {"type": "video", "video": str(seg),
+                 "fps": self.args.fps,
+                 "total_pixels": self.args.total_pixels_factor * 32 * 32},
+                {"type": "text", "text": prompt},
+            ],
+        }]
+        text = self.processor.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True)
+        # use_audio_in_video MUST match between process_mm_info and the
+        # processor call. Mismatched, the audio and video token counts
+        # disagree and it fails deep inside the model with a shape error.
+        audios, images, videos = self._process_mm_info(
+            msgs, use_audio_in_video=use_audio)
+        # dtype=, not just device=. The audio feature extractor emits
+        # float32 mel features, but the audio tower's weights are bf16, and
+        # a bare .to(device) moves them without converting:
+        #   Input type (float) and bias type (c10::BFloat16) should be the
+        #   same
+        # -- raised on the tower's first Conv1d, so EVERY segment fails and
+        # none of them fail for a reason that mentions audio.
+        #
+        # BatchFeature.to() applies a dtype only to floating-point tensors
+        # and merely moves the rest, so input_ids stays Long. That is why
+        # this can be a blanket cast rather than a per-key one.
+        inputs = self.processor(
+            text=[text], audio=audios, images=images, videos=videos,
+            return_tensors="pt", padding=True,
+            use_audio_in_video=use_audio,
+        ).to(device=self.model.device, dtype=self.model.dtype)
+
+        with torch.inference_mode():
+            out = self.model.generate(
+                **inputs,
+                # thinker_max_new_tokens, NOT max_new_tokens. Omni's
+                # generate() seeds thinker_kwargs with its OWN default of
+                # 1024 and then merges extra kwargs only `if key not in
+                # thinker_kwargs` -- so a plain max_new_tokens is silently
+                # DISCARDED. That is a 4x longer generation than every
+                # other backend, and the rambling this prompt was designed
+                # to stop, with nothing in the output to say why.
+                thinker_max_new_tokens=self.args.max_new_tokens,
+                # These two have no thinker_ default, so they fall through
+                # shared_kwargs into the thinker as-is.
+                do_sample=False,
+                repetition_penalty=1.05,
+                use_audio_in_video=use_audio,
+                return_audio=False,     # text out; no speech synthesis
+            )
+        # generate() ALWAYS returns (thinker_result, None) when it is not
+        # synthesising audio -- a tuple even with the talker deleted.
+        if isinstance(out, (tuple, list)):
+            out = out[0]
+        return self.processor.batch_decode(
+            out[:, inputs["input_ids"].shape[1]:],
+            skip_special_tokens=True)[0].strip()
 
 
 BACKENDS = {"qwen": QwenAnnotator, "internvl": InternVLAnnotator,
@@ -1335,7 +1370,7 @@ def main():
     # the counts are lost along with the prose. Only bumped when the default
     # was left untouched, so an explicit --max-new-tokens still wins.
     if native_audio and args.max_new_tokens == 256:
-        args.max_new_tokens = 384
+        args.max_new_tokens = 512
         print(f"note:     --max-new-tokens raised to {args.max_new_tokens} for "
               f"the audio schema (5 extra fields)", flush=True)
     prompt_sha = hashlib.sha256(
@@ -1595,6 +1630,12 @@ def main():
     print(f"\n{ok} parsed, {bad} unparseable, of {n} segments "
           f"in {total/60:.1f} min ({total/max(ok+bad,1):.1f}s each)")
     print(f"wrote {args.out}")
+    dropped = getattr(annotator, "audio_dropped", 0)
+    if dropped:
+        print(f"WARNING: {dropped} of {n} segments produced NaN with audio and "
+              f"were answered video-only.\n"
+              f"         Those rows are NOT evidence about what hearing adds. "
+              f"Try --attn-impl eager.")
 
     if run is not None:
         summary = {
