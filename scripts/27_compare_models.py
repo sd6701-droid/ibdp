@@ -94,6 +94,14 @@ def main():
                     help="0 = print every segment")
     ap.add_argument("--csv", type=Path, default=None,
                     help="also write the full per-segment table here")
+    ap.add_argument("--wandb", action="store_true",
+                    help="log the comparison to W&B, in the same group as the "
+                         "per-model runs")
+    ap.add_argument("--wandb-project", default="ibdp-annotation")
+    ap.add_argument("--wandb-mode", default="offline",
+                    choices=["offline", "online", "disabled"])
+    ap.add_argument("--wandb-dir", type=Path, default=None,
+                    help="where offline runs are written (default: --outdir)")
     args = ap.parse_args()
 
     if not args.outdir.is_dir():
@@ -148,6 +156,7 @@ def main():
     print(f"models   : {len(models)}\n")
 
     # ---- per-model health --------------------------------------------------
+    health = []
     print(f"{'model':32s} {'segs':>5s} {'parse_fail':>10s} "
           f"{'inconsistent':>12s} {'s/seg':>7s}")
     for m in models:
@@ -155,8 +164,10 @@ def main():
         bad = sum(1 for r in recs if not r.get("parse_ok"))
         inc = sum(1 for r in recs if r.get("inconsistent"))
         el = [r["elapsed_sec"] for r in recs if r.get("elapsed_sec") is not None]
-        el_s = f"{sum(el) / len(el):.1f}" if el else "n/a"
+        sec = sum(el) / len(el) if el else None
+        el_s = f"{sec:.1f}" if sec is not None else "n/a"
         print(f"{m:32s} {len(recs):5d} {bad:10d} {inc:12d} {el_s:>7s}")
+        health.append([m, len(recs), bad, inc, sec])
     print()
 
     # ---- pairwise agreement ------------------------------------------------
@@ -164,6 +175,7 @@ def main():
     # denominator: a parse failure is not a disagreement about content, and
     # counting it as one would flatter whichever model failed more often.
     print("pairwise agreement (parse failures excluded)")
+    agree_rows = []
     for f in fields:
         print(f"  {f}")
         for a, b in combinations(models, 2):
@@ -176,6 +188,8 @@ def main():
                 same += ra.get(f) == rb.get(f)
             pct = f"{100 * same / tot:5.1f}%" if tot else "  n/a"
             print(f"    {a:30s} vs {b:30s} {pct}  ({same}/{tot})")
+            agree_rows.append([f, a, b, 100 * same / tot if tot else None,
+                               same, tot])
     print()
 
     # ---- disagreements -----------------------------------------------------
@@ -222,6 +236,85 @@ def main():
                     row[f"{m}:description"] = (rec or {}).get("description", "")
                 wtr.writerow(row)
         print(f"\nwrote {args.csv}")
+
+    # ---- wandb -------------------------------------------------------------
+    if args.wandb:
+        log_to_wandb(args, sha, models, segs, rows, health, agree_rows, fields,
+                     field)
+
+
+def log_to_wandb(args, sha, models, segs, rows, health, agree_rows, fields,
+                 field):
+    """One run per comparison, in the SAME group as the per-model runs.
+
+    Group is the video id, so in the W&B UI the comparison sits alongside the
+    models it compares rather than in a separate project you have to correlate
+    by hand. job_type="compare" keeps it distinguishable from the annotation
+    runs it summarises.
+
+    Offline by default for the same reason as scripts/26: online mode does not
+    fail fast on a firewalled node, it blocks and then drops the data."""
+    try:
+        import wandb
+    except ImportError:
+        raise SystemExit(
+            "--wandb needs the wandb package.\n"
+            "  ssh bigpurple-ln3 && conda activate ibdp && pip install wandb")
+    import os
+
+    os.environ.setdefault("WANDB_MODE", args.wandb_mode)
+    os.environ.setdefault("WANDB_DIR", str(args.wandb_dir or args.outdir))
+
+    run = wandb.init(
+        project=args.wandb_project,
+        name=f"compare--{args.video}",
+        group=args.video,
+        job_type="compare",
+        config={"video": args.video, "prompt_sha": sha, "models": models,
+                "n_segments": len(segs), "fields": fields},
+    )
+
+    health_tbl = wandb.Table(
+        columns=["model", "segments", "parse_fail", "inconsistent", "sec_per_segment"],
+        data=[list(r) for r in health])
+    agree_tbl = wandb.Table(
+        columns=["field", "model_a", "model_b", "agreement_pct", "n_same", "n_compared"],
+        data=[list(r) for r in agree_rows])
+
+    seg_cols = ["segment", "timestamp", "url_at", "agree"]
+    for m in models:
+        seg_cols += [f"{m}:{field}", f"{m}:description"]
+    seg_data = []
+    for r in rows:
+        d = [r["segment"], r["timestamp"], r["url_at"], bool(r["agree"])]
+        for rec, v in zip(r["recs"], r["vals"]):
+            d += [v, (rec or {}).get("description", "")]
+        seg_data.append(d)
+    seg_tbl = wandb.Table(columns=seg_cols, data=seg_data)
+
+    run.log({"health": health_tbl, "agreement": agree_tbl, "segments": seg_tbl})
+
+    # Scalars too, not just tables: summary values are what W&B can sort and
+    # chart across runs. A table alone cannot be compared between videos.
+    summary = {"n_segments": len(segs),
+               "n_disagreements": sum(1 for r in rows if not r["agree"])}
+    for f in fields:
+        pcts = [r[3] for r in agree_rows if r[0] == f and r[3] is not None]
+        if pcts:
+            summary[f"agreement/{f}_mean_pct"] = sum(pcts) / len(pcts)
+            summary[f"agreement/{f}_min_pct"] = min(pcts)
+    for m, n, bad, inc, sec in health:
+        summary[f"model/{m}/parse_fail"] = bad
+        summary[f"model/{m}/inconsistent"] = inc
+        if sec is not None:
+            summary[f"model/{m}/sec_per_segment"] = sec
+    run.summary.update(summary)
+    run.finish()
+
+    print(f"\nwandb: logged comparison as run compare--{args.video}")
+    if os.environ.get("WANDB_MODE") == "offline":
+        print(f"  sync from a login node:  wandb sync "
+              f"{args.wandb_dir or args.outdir}/wandb/offline-run-*")
 
 
 if __name__ == "__main__":

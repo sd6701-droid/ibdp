@@ -209,8 +209,18 @@ echo "=== comparison ==="
 # Only the models that actually succeeded: passing a failed one would abort the
 # comparison over a file that was never written.
 joined="$(IFS=,; echo "${OK_MODELS[*]}")"
+
+# --wandb is aimed at the PYTHON annotator, so it arrives in EXTRA. The compare
+# step is a separate process and would not see it -- forward it explicitly, or
+# the models land in W&B and the comparison that explains them does not.
+declare -a CMP_WANDB=()
+for a in "${EXTRA[@]:-}"; do
+  [[ "$a" == "--wandb" ]] && CMP_WANDB=(--wandb)
+done
+
 python scripts/27_compare_models.py \
     --outdir "$OUTDIR" --video "$VIDEO" --models "$joined" --csv "$csv" \
+    "${CMP_WANDB[@]}" \
     2>&1 | tee "$txt"
 
 echo
