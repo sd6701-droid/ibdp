@@ -44,4 +44,12 @@ echo "node=$(hostname) job=${SLURM_JOB_ID:-?}"
 echo "args: $*"
 ffmpeg -version | head -1
 
-srun python scripts/32_split_scenes.py "$@"
+# NO srun, deliberately. This is a single-task job, so srun adds nothing --
+# and it actively breaks when the sbatch was submitted from INSIDE another
+# job (an interactive session): sbatch exports the submitter's environment,
+# the parent job's SLURM_CPU_BIND names CPUs on the parent's node, and srun
+# then dies on whatever node this job landed on with
+#   "CPU binding outside of job step allocation"
+# Running python directly uses this job's own allocation and cannot inherit
+# a stale binding.
+python scripts/32_split_scenes.py "$@"
