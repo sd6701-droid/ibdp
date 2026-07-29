@@ -327,7 +327,64 @@ def log_to_wandb(args, sha, models, segs, rows, health, agree_rows, fields,
         seg_data.append(d)
     seg_tbl = wandb.Table(columns=seg_cols, data=seg_data)
 
-    run.log({"health": health_tbl, "agreement": agree_tbl, "segments": seg_tbl})
+    # ---- one table, every model -------------------------------------------
+    # LONG format: one row per (model, segment), with `model` as the first
+    # column -- rather than the wide `segments` table above, which puts each
+    # model in its own set of columns.
+    #
+    # Long is what you want for a single combined view: you can sort by
+    # num_infants across all models at once, filter to one model, or group by
+    # model, none of which a wide table supports. Wide is better only when you
+    # are eyeballing one segment across models side by side, which is why both
+    # are logged.
+    #
+    # audio_mode is carried explicitly so a blank audio column reads as "this
+    # model had no audio" rather than "this model heard nothing" -- the same
+    # trap as a null field in the JSONL.
+    audio_keys = ["audio_events", "infant_vocalising", "speech_present",
+                  "audio_inconsistent", "audio_description"]
+    has_audio = any(any(k in (rec or {}) for k in audio_keys)
+                    for r in rows for rec in r["recs"])
+
+    long_cols = ["model", "audio_mode", "segment", "timestamp", "url_at",
+                 "parse_ok", "num_infants", "num_children", "num_adults",
+                 "num_humans_total", "infant_visibility", "visible_parts",
+                 "inconsistent", "description"]
+    if has_audio:
+        long_cols += audio_keys
+    long_cols += ["elapsed_sec", "prompt_sha"]
+
+    long_data = []
+    for r in rows:
+        for model, rec in zip(models, r["recs"]):
+            if rec is None:          # this model skipped or crashed on it
+                continue
+            parts = rec.get("visible_infant_parts") or []
+            row = [
+                model,
+                "native" if rec.get("backend") == "qwen-omni" else
+                ("transcript" if rec.get("audio_mode") == "transcript" else "none"),
+                rec.get("segment_index"), rec.get("timestamp"),
+                rec.get("url_at"), bool(rec.get("parse_ok")),
+                rec.get("num_infants"), rec.get("num_children"),
+                rec.get("num_adults"), rec.get("num_humans_total"),
+                rec.get("infant_visibility"),
+                ", ".join(parts) if isinstance(parts, list) else str(parts),
+                bool(rec.get("inconsistent")),
+                rec.get("description") or (rec.get("raw") or "")[:500],
+            ]
+            if has_audio:
+                ev = rec.get("audio_events")
+                row += [", ".join(ev) if isinstance(ev, list) else ev,
+                        rec.get("infant_vocalising"), rec.get("speech_present"),
+                        rec.get("audio_inconsistent"), rec.get("audio_description")]
+            row += [rec.get("elapsed_sec"), rec.get("prompt_sha")]
+            long_data.append(row)
+
+    all_tbl = wandb.Table(columns=long_cols, data=long_data)
+
+    run.log({"all_models": all_tbl, "health": health_tbl,
+             "agreement": agree_tbl, "segments": seg_tbl})
 
     # Scalars too, not just tables: summary values are what W&B can sort and
     # chart across runs. A table alone cannot be compared between videos.

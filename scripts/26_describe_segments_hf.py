@@ -62,6 +62,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 os.environ.setdefault("FORCE_QWENVL_VIDEO_READER", "torchcodec")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
+# librosa has no soundfile backend for mp4 audio, so it falls back to audioread
+# and emits a FOUR-LINE FutureWarning for every segment. Over a 22-segment video
+# that is ~90 lines of identical deprecation notice interleaved with 22 lines of
+# actual progress, which makes the log unreadable exactly when you are trying to
+# read it.
+#
+# "once", not "ignore": the warning is still worth seeing one time -- audioread
+# is also the SLOW path, and when librosa 1.0 removes it this breaks. Hiding it
+# entirely would mean discovering that at upgrade time instead.
+import warnings
+warnings.filterwarnings("once", category=FutureWarning, module="librosa")
+
 
 def _preload_cuda_libs():
     """torchcodec's .so needs libnppicc.so.12 / libnvrtc, which live in the
@@ -1111,8 +1123,14 @@ def log_table(run, rows: list, audio: bool, model_tag: str = None):
               f"(audio={audio}) -- dropping them.", flush=True)
         rows = [r for i, r in enumerate(rows) if i not in set(wrong)]
 
-    key = (f"{model_tag}/results"
-           if model_tag and os.environ.get("WANDB_RUN_ID") else "results")
+    # KEY IS THE MODEL NAME ITSELF, in both modes.
+    #
+    # Same query whether you ran one shared run or six separate ones:
+    #     runs.summary["Qwen3-VL-32B-Instruct"]
+    # rather than "results" in one mode and "<model>/results" in the other --
+    # a panel query that breaks when you flip WANDB_SEPARATE_RUNS is a panel
+    # query you have to rebuild every time you change how the sweep is run.
+    key = model_tag or "results"
 
     # Say WHERE the table went, once per key. Without this the only way to find
     # out a table landed under <model>/results rather than results is to hunt
@@ -1311,6 +1329,11 @@ def main():
     ap.add_argument("--only", default=None,
                     help="comma-separated video id(s); process only these.")
     ap.add_argument("--seconds", type=float, default=10.0, help="window length")
+    ap.add_argument("--max-seconds", type=float, default=0,
+                    help="0 = whole video. Otherwise annotate only the first N "
+                         "seconds -- for shakedown runs. Segment indices and "
+                         "boundaries match a full run, so a later full run "
+                         "resumes over it cleanly.")
     ap.add_argument("--min-tail", type=float, default=2.0)
     ap.add_argument("--fps", type=float, default=2.0)
     # 256: the structured fields are tiny and `description` is capped at two
@@ -1365,10 +1388,22 @@ def main():
     native_audio = backend == "qwen-omni"
 
     # The audio schema adds five keys on top of the twelve video ones, and the
-    # 256 default was sized for the video-only answer. Segments came back as
-    # valid JSON cut off mid-"description", which parses as nothing at all --
-    # the counts are lost along with the prose. Only bumped when the default
-    # was left untouched, so an explicit --max-new-tokens still wins.
+    # 256 default was sized for the video-only answer.
+    #
+    # 512, NOT 384, and the number comes from measurement rather than taste.
+    # Two truncated segments of 8yDn1uFbs4s stopped at 936 and 909 characters --
+    # ~250 tokens, i.e. exactly the 256 cap -- and had reached only
+    # "audio_description" and "infant_vocalising" respectively, with up to four
+    # fields still to emit. 384 would have clipped the longer of those too.
+    #
+    # The model pretty-prints its JSON (newlines, 2-space indent), which burns
+    # perhaps a third of the budget on whitespace. Telling it to emit compact
+    # JSON would be the cheaper fix, but that changes PROMPT and therefore
+    # prompt_sha, invalidating every annotation already collected. A bigger cap
+    # costs nothing when generation stops at EOS anyway.
+    #
+    # Only bumped when the default was left untouched, so an explicit
+    # --max-new-tokens still wins.
     if native_audio and args.max_new_tokens == 256:
         args.max_new_tokens = 512
         print(f"note:     --max-new-tokens raised to {args.max_new_tokens} for "
@@ -1464,8 +1499,16 @@ def main():
         if not info["duration"]:
             skipped.append(f"{vid} (no duration)")
             continue
+        # --max-seconds caps the DURATION, which caps the number of windows.
+        # Segment indices are unaffected: a capped run produces exactly the
+        # first N segments of a full run, with the same indices, the same
+        # boundaries and the same prompt_sha. So a later full run resumes over
+        # the top of it rather than treating it as a different corpus.
+        duration = info["duration"]
+        if args.max_seconds:
+            duration = min(duration, args.max_seconds)
         for i, (start, end) in enumerate(
-                segments(info["duration"], args.seconds, args.min_tail)):
+                segments(duration, args.seconds, args.min_tail)):
             if (vid, i) not in done:
                 work.append((clip, vid, info["title"], info["url"], i, start, end))
 

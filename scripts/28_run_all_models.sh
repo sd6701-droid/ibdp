@@ -59,6 +59,22 @@ MODELS="${MODELS:-Qwen3-VL-30B-A3B-Instruct Qwen3-Omni-30B-A3B-Instruct Qwen3-VL
 # mixing two modalities in one file.
 AUDIO="${AUDIO:-0}"
 
+# --- Shakedown window ------------------------------------------------------
+# Annotate only the first MAX_SECONDS of the video. 50s at the default 10s
+# window is 5 segments per model -- about 2 minutes of inference each, against
+# ~8 minutes for a full 22-segment pass, so a six-model sweep is ~15 minutes
+# instead of an hour.
+#
+# DEFAULTED TO 50 WHILE WE ARE STILL TESTING. This is a trap if you forget it:
+# a "full run" that quietly stops at 50 seconds looks like a complete corpus.
+# Hence the banner below, and MAX_SECONDS=0 to turn it off:
+#
+#   MAX_SECONDS=0 scripts/28_run_all_models.sh VIDEO_ID
+#
+# Segment indices match a full run, so the capped records are the genuine first
+# five and a later MAX_SECONDS=0 run resumes over the top of them.
+MAX_SECONDS="${MAX_SECONDS:-50}"
+
 VIDEO="${1:-}"
 shift 2>/dev/null || true
 EXTRA=("$@")              # everything else is forwarded to the python script
@@ -220,6 +236,12 @@ echo
 echo "video  : $VIDEO"
 echo "models : $MODELS"
 echo "audio  : $([[ "$AUDIO" == "1" ]] && echo "transcript in prompt (Omni: native)" || echo "off (video only)")"
+if [[ "${MAX_SECONDS:-0}" != "0" ]]; then
+  echo "window : FIRST ${MAX_SECONDS}s ONLY -- shakedown run, NOT the full video"
+  echo "         (MAX_SECONDS=0 for the whole thing)"
+else
+  echo "window : whole video"
+fi
 echo "outdir : $OUTDIR"
 echo "extra  : ${EXTRA[*]:-(none)}"
 echo
@@ -246,11 +268,24 @@ for M in $MODELS; do
     AUDIO_ARGS=(--transcribe)
   fi
 
+  # Shakedown window, when MAX_SECONDS is non-zero. Built per iteration rather
+  # than once, so `set -u` cannot trip over an unset array on the first model.
+  declare -a LIMIT_ARG=()
+  if [[ "${MAX_SECONDS:-0}" != "0" ]]; then
+    LIMIT_ARG=(--max-seconds "$MAX_SECONDS")
+  fi
+
+  declare -a RESUME_ARG=(--resume)
+  if [[ "${NO_RESUME:-0}" == "1" ]]; then
+    RESUME_ARG=()
+  fi
+
   python scripts/26_describe_segments_hf.py \
       --model "$ROOT/models/$M" \
       --only "$VIDEO" \
       --outdir "$OUTDIR" \
-      --resume \
+      "${RESUME_ARG[@]}" \
+      "${LIMIT_ARG[@]}" \
       "${AUDIO_ARGS[@]}" \
       "${EXTRA[@]}" 2>&1 | tee "$log"
 
