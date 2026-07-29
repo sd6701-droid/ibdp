@@ -650,6 +650,9 @@ class QwenOmniAnnotator:
         # itself, including anything left by a segment that raised mid-cut.
         atexit.register(shutil.rmtree, self._tmp, True)
 
+        # After _tmp exists -- the wrapped loader writes its wavs there.
+        self._patch_audio_loader()
+
     def _cut(self, clip: Path, start: float, end: float) -> Path:
         """[start, end] of clip -> a real mp4, video AND audio.
 
@@ -767,21 +770,7 @@ class QwenOmniAnnotator:
         else:
             seg = self._cut(clip, start, end)
         try:
-            # SEGFAULT GUARD. qwen_omni_utils loads the clip's audio through
-            # librosa's audioread fallback (soundfile cannot open mp4), and on
-            # rare clips that native decode SEGFAULTS -- reproducibly: seg 602
-            # of 0HkcGRBsPUM killed two runs on two different nodes at the
-            # same spot. A segfault is not an exception; it takes the process
-            # and every queued segment with it. So decode the audio once in a
-            # THROWAWAY subprocess first: if that child dies, this process
-            # survives and the segment is answered video-only, marked as such.
-            use_audio = self._audio_decodes_safely(seg)
-            if not use_audio:
-                print("      audio decode crashed/failed in probe subprocess "
-                      "-- annotating video-only", flush=True)
-                self.audio_dropped += 1
-
-            raw = self._generate(seg, prompt, use_audio=use_audio)
+            raw = self._generate(seg, prompt, use_audio=True)
 
             # NaN RECOVERY. '!!!!!!' is token 0 repeated, which is argmax over
             # all-NaN logits. The NaN originates in the audio path: a silent or
@@ -796,7 +785,7 @@ class QwenOmniAnnotator:
             # a partial answer is never mistaken for a heard one. If it is still
             # degenerate the cause is not audio, and --attn-impl eager is the
             # next thing to try.
-            if use_audio and is_degenerate(raw):
+            if is_degenerate(raw):
                 print("      degenerate (NaN) with audio -- retrying "
                       "video-only", flush=True)
                 retry = self._generate(seg, prompt, use_audio=False)
@@ -813,30 +802,68 @@ class QwenOmniAnnotator:
             if seg is not clip:
                 seg.unlink(missing_ok=True)
 
-    def _audio_decodes_safely(self, seg: Path) -> bool:
-        """Decode seg's audio the same way qwen_omni_utils will -- but in a
-        subprocess, where a native-decoder SEGFAULT kills the child and not
-        the run.
+    def _patch_audio_loader(self):
+        """Move the audio DECODE out of this process entirely.
 
-        librosa.load on an mp4 goes soundfile (fails on mp4) -> audioread ->
-        a native decode that crashed twice on the same clip window (seg 602 of
-        0HkcGRBsPUM), on different nodes, at address (nil). The probe mirrors
-        that exact path (16kHz mono is what the Omni feature extractor asks
-        for), so a clip that passes here is a clip the real load survives.
+        qwen_omni_utils pulls the clip's soundtrack with librosa.load. For an
+        mp4, librosa cannot use soundfile and falls back to audioread's
+        IN-PROCESS native decode -- which segfaulted three runs in a row, each
+        time on the SEVENTH decode of the run: seg 602 twice, then seg 7-of-250
+        after the omni-skip renumbered the corpus. Different files, different
+        nodes, same ordinal. A per-file probe subprocess did NOT predict it --
+        the child decoded the very file the parent then died on -- so this is
+        cumulative in-process corruption (audioread + the preloaded HPC shims
+        this cluster injects; [NVBLAS] errors survive `unset LD_PRELOAD`, so
+        they arrive via system config we cannot switch off).
 
-        Any child failure -- signal, non-zero exit, hang past the timeout --
-        reads as "do not feed this audio to the model". The cost is a python
-        + librosa startup (~2-4s) per segment, which the run pays gladly: the
-        alternative was one clip killing every segment behind it."""
-        code = ("import sys, librosa; "
-                "librosa.load(sys.argv[1], sr=16000, mono=True); "
-                "print('ok')")
-        try:
-            p = subprocess.run([sys.executable, "-c", code, str(seg)],
-                               capture_output=True, text=True, timeout=300)
-        except subprocess.TimeoutExpired:
-            return False
-        return p.returncode == 0
+        The wrap: librosa.load on anything that is not already wav/flac first
+        extracts the audio with the ffmpeg CLI -- a separate process that
+        cannot corrupt this one -- to mono PCM wav, then reads it with
+        soundfile (libsndfile: no audioread, no in-process compressed decode).
+        Identical samples, identical use_audio_in_video interleaving; only
+        WHERE the decoding happens changes. An extraction failure raises,
+        which the per-segment try/except turns into one FAIL line instead of
+        a dead run."""
+        import librosa
+        import numpy as np
+        import soundfile
+
+        orig_load = librosa.load
+        tmpdir = self._tmp
+
+        def safe_load(path, *args, sr=22050, mono=True, offset=0.0,
+                      duration=None, **kwargs):
+            p = str(path)
+            # Real files only: librosa.load also accepts file-like objects,
+            # which ffmpeg cannot take -- those keep the original path.
+            if not os.path.isfile(p) or p.lower().endswith((".wav", ".flac")):
+                return orig_load(path, *args, sr=sr, mono=mono, offset=offset,
+                                 duration=duration, **kwargs)
+            fd, wav = tempfile.mkstemp(suffix=".wav", dir=str(tmpdir))
+            os.close(fd)
+            try:
+                cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+                if offset:
+                    cmd += ["-ss", str(float(offset))]
+                cmd += ["-i", p]
+                if duration is not None:
+                    cmd += ["-t", str(float(duration))]
+                cmd += ["-vn", "-ac", "1" if mono else "2"]
+                if sr:
+                    cmd += ["-ar", str(int(sr))]
+                cmd += ["-c:a", "pcm_f32le", wav]
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                if r.returncode != 0:
+                    raise RuntimeError(f"ffmpeg audio extract failed for {p}: "
+                                       f"{r.stderr.strip()}")
+                y, got_sr = soundfile.read(wav, dtype="float32")
+                if y.ndim > 1:
+                    y = y.mean(axis=1)
+                return np.ascontiguousarray(y, dtype=np.float32), got_sr
+            finally:
+                os.unlink(wav)
+
+        librosa.load = safe_load
 
     def _generate(self, seg: Path, prompt: str, use_audio: bool) -> str:
         """One forward pass over an already-cut segment.
