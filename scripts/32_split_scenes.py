@@ -5,6 +5,7 @@ audio that belongs to it -- using TransNetV2 shot-boundary detection.
 
     python scripts/32_split_scenes.py --only 8yDn1uFbs4s
 
+    
     <outdir>/8yDn1uFbs4s/
         scenes.json          every boundary, in frames and seconds, with scores
         scenes.csv           the same thing you can eyeball in a terminal
