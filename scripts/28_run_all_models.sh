@@ -92,11 +92,14 @@ EXTRA=("$@")              # everything else is forwarded to the python script
 # runs. Want both? Use --wandb WITHOUT this switch and ignore the charts.
 WANDB_TABLES_ONLY="${WANDB_TABLES_ONLY:-0}"
 if [[ "$WANDB_TABLES_ONLY" == "1" ]]; then
+  # ${arr[@]+"${arr[@]}"} not "${arr[@]:-}": the latter turns an empty array
+  # into ONE EMPTY-STRING ARG, which argparse rejects as "unrecognized
+  # arguments:" when it reaches the python script.
   declare -a _KEEP=()
-  for a in "${EXTRA[@]:-}"; do
+  for a in ${EXTRA[@]+"${EXTRA[@]}"}; do
     [[ "$a" == "--wandb" ]] || _KEEP+=("$a")
   done
-  EXTRA=("${_KEEP[@]:-}")
+  EXTRA=(${_KEEP[@]+"${_KEEP[@]}"})
 fi
 
 [[ -n "$VIDEO" ]] || {
@@ -242,7 +245,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # models' system metrics side by side without untangling prefixes.
 # ---------------------------------------------------------------------------
 if [[ "${WANDB_SEPARATE_RUNS:-0}" != "1" ]]; then
-  for a in "${EXTRA[@]:-}"; do
+  for a in ${EXTRA[@]+"${EXTRA[@]}"}; do
     if [[ "$a" == "--wandb" ]]; then
       export WANDB_RUN_ID="allmodels-${VIDEO}"
       export WANDB_RESUME=allow
@@ -307,7 +310,7 @@ for M in $MODELS; do
       "${RESUME_ARG[@]}" \
       "${LIMIT_ARG[@]}" \
       "${AUDIO_ARGS[@]}" \
-      "${EXTRA[@]}" 2>&1 | tee "$log"
+      ${EXTRA[@]+"${EXTRA[@]}"} 2>&1 | tee "$log"
 
   # PIPESTATUS[0], not $?: $? is tee's status, which is 0 even when python died.
   if [[ "${PIPESTATUS[0]}" -eq 0 ]]; then
@@ -344,7 +347,7 @@ joined="$(IFS=,; echo "${OK_MODELS[*]}")"
 # step is a separate process and would not see it -- forward it explicitly, or
 # the models land in W&B and the comparison that explains them does not.
 declare -a CMP_WANDB=()
-for a in "${EXTRA[@]:-}"; do
+for a in ${EXTRA[@]+"${EXTRA[@]}"}; do
   [[ "$a" == "--wandb" ]] && CMP_WANDB=(--wandb)
 done
 # Tables-only mode stripped --wandb from EXTRA above, so force the compare
