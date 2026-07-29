@@ -753,7 +753,27 @@ class QwenOmniAnnotator:
                 f"the stream ({limit}) -- the manifest duration overshoots "
                 f"the file.")
 
-        seg = self._cut(clip, start, end)
+        # WHOLE-FILE FAST PATH. When the window covers the entire clip -- which
+        # is every segment in --scenes mode, where scripts/32 already cut the
+        # file -- there is nothing to cut. Skipping _cut() matters twice over:
+        # it avoids a SECOND lossy re-encode on top of the one the splitter
+        # already paid (a confound the other backends don't carry), and it
+        # keeps the cleanup below from unlinking a file we do not own.
+        whole = (limit is not None and start <= 0.05 and end >= limit - 0.05)
+        if whole:
+            # _cut() is also where "no audio track" is caught; the fast path
+            # must keep that guarantee, or a silent clip segfaults the native
+            # audio decoder exactly as described above.
+            q = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "a",
+                 "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+                 str(clip)], capture_output=True, text=True)
+            if "audio" not in q.stdout:
+                raise RuntimeError(f"{clip} has no audio stream; this backend "
+                                   f"exists to hear it.")
+            seg = clip
+        else:
+            seg = self._cut(clip, start, end)
         try:
             raw = self._generate(seg, prompt, use_audio=True)
 
@@ -780,8 +800,12 @@ class QwenOmniAnnotator:
             return raw
         finally:
             # Per segment, not per run: a 500s video at 10s windows would
-            # otherwise leave 50 re-encoded mp4s in $TMPDIR.
-            seg.unlink(missing_ok=True)
+            # otherwise leave 50 re-encoded mp4s in $TMPDIR. The identity
+            # check is what makes the fast path safe -- seg IS the caller's
+            # file there, and unlinking it would destroy a split clip that
+            # scripts/32 spent minutes producing.
+            if seg is not clip:
+                seg.unlink(missing_ok=True)
 
     def _generate(self, seg: Path, prompt: str, use_audio: bool) -> str:
         """One forward pass over an already-cut segment.
@@ -914,13 +938,19 @@ class CachedTranscriber:
             torch_dtype=dtype, device=0 if torch.cuda.is_available() else -1,
             chunk_length_s=30, return_timestamps="word")
 
-    def words(self, clip: Path) -> list:
+    def words(self, clip: Path, cache_id: str = None) -> list:
         """[{w, start, end}] for the whole track. Cached on disk and in memory.
 
         Returns [] for a clip with no audio -- a silent video is a fact about
         the corpus, not an error, and the annotation still has the frames.
+
+        cache_id overrides the cache key. The default, clip.stem, is only
+        unique when files are named <video_id>.mp4 -- in --scenes mode every
+        split is literally named clip.mp4, and without an explicit id all
+        splits of all videos would share ONE cache entry: the first split
+        transcribed would silently become the transcript of everything.
         """
-        vid = clip.stem
+        vid = cache_id or clip.stem
         if vid in self._mem:
             return self._mem[vid]
 
@@ -965,14 +995,15 @@ class CachedTranscriber:
         self._mem[vid] = words
         return words
 
-    def segment_text(self, clip: Path, start: float, end: float) -> str:
+    def segment_text(self, clip: Path, start: float, end: float,
+                     cache_id: str = None) -> str:
         """Words whose MIDPOINT lands in [start, end).
 
         Midpoint, not overlap: a word straddling the boundary would otherwise
         be handed to both segments, and the per-segment transcripts would no
         longer sum back to what was actually said.
         """
-        out = [w["w"] for w in self.words(clip)
+        out = [w["w"] for w in self.words(clip, cache_id)
                if start <= (w["start"] + w["end"]) / 2.0 < end]
         return " ".join(out).strip()
 
@@ -1054,6 +1085,11 @@ def init_wandb(args, model_tag, backend, prompt_sha, videos, n_segments):
             "prompt_sha": prompt_sha,
             "videos": videos,
             "n_segments": n_segments,
+            # Grid windows or shot-boundary splits -- a run over 26 scene
+            # clips and a run over 22 grid windows of the same video must
+            # never be read as the same experiment.
+            "segmentation": ("scenes" if args.scenes else "fixed"),
+            "scenes_dir": (str(args.scenes) if args.scenes else None),
             "window_sec": args.seconds,
             "min_tail_sec": args.min_tail,     # also moves segment boundaries
             "fps": args.fps,
@@ -1086,7 +1122,13 @@ def table_columns(audio: bool) -> list:
     # <model>/results key: the key is lost the moment a table is exported to
     # CSV or two tables are concatenated, and a row that cannot say who wrote it
     # is unusable for exactly the comparison this table exists to support.
-    cols = ["model", "segment", "timestamp", "url_at", "parse_ok",
+    # video_id + url right after model: an all-videos sweep puts five videos'
+    # splits in ONE table, and a row that cannot say which video it describes
+    # (or link to it) is unusable the moment the table is sorted or filtered.
+    # "split" is the human-readable split_NN; "url_at" deep-links to the
+    # split's own start time within that video.
+    cols = ["model", "video_id", "url", "split", "segment", "timestamp",
+            "url_at", "parse_ok",
             "num_infants", "num_children", "num_adults", "num_humans_total",
             "infant_visibility", "visible_parts", "inconsistent",
             "location", "surface", "camera_distance", "lighting",
@@ -1107,6 +1149,9 @@ def table_row(rec: dict, ann: dict, audio: bool) -> list:
     # rec already carries the tag written into every JSONL record, so the table
     # and the file on disk cannot drift apart on who produced a row.
     row = [rec.get("model", ""),
+           rec.get("video_id", ""),
+           rec.get("url", ""),
+           rec.get("split") or "",
            rec["segment_index"], rec["timestamp"], rec["url_at"],
            bool(ann.get("parse_ok")),
            ann.get("num_infants"), ann.get("num_children"),
@@ -1385,6 +1430,23 @@ def main():
                     help="short name used in the output filename and in every "
                          "record (default: the checkpoint directory name)")
     ap.add_argument("--videos", type=Path, default=ROOT / "youtube_dataset/videos")
+    # SCENE-SPLIT MODE. Instead of cutting a fixed 10s grid over the full
+    # video, annotate the pre-cut clips written by scripts/32_split_scenes.py:
+    #
+    #     <scenes>/<video_id>/split_NN/{clip.mp4, meta.json}
+    #
+    # One segment per split, whole clip per forward pass. segment_index is the
+    # split's 1-based index, and start/end in every record are the ORIGINAL
+    # video's coordinates (from meta.json), so url_at still deep-links into
+    # YouTube and the W&B tables read the same as a fixed-grid run.
+    #
+    # --seconds and --min-tail are ignored here (the edit already decided the
+    # boundaries); --max-seconds still works, as "only splits that START inside
+    # the first N seconds" -- the same shakedown semantics as the grid.
+    ap.add_argument("--scenes", type=Path, default=None,
+                    help="annotate scene splits from this dir "
+                         "(outputs/scenes) instead of fixed windows over "
+                         "--videos. See scripts/32_split_scenes.py.")
     ap.add_argument("--manifest", type=Path,
                     default=ROOT / "youtube_dataset/manifest.tsv")
     # Default: a NEW timestamped file per run, so a run never mutates an older
@@ -1400,7 +1462,17 @@ def main():
                     help="0 = all VIDEOS (not segments). Use 2 to measure speed.")
     ap.add_argument("--only", default=None,
                     help="comma-separated video id(s); process only these.")
-    ap.add_argument("--seconds", type=float, default=10.0, help="window length")
+    ap.add_argument("--seconds", type=float, default=10.0,
+                    help="window length on the fixed grid; in --scenes mode, "
+                         "the sub-window length for clips over --clip-max-sec")
+    # Scenes mode only. A 6s source clip is one forward pass -- that is the
+    # point of splitting on the edit. But a 40s clip at 2fps is 80 frames in
+    # one context: past the token budget, and an "at some point in the clip"
+    # answer that aggregates badly. Over this length the clip is windowed with
+    # --seconds, exactly like the grid but LOCAL to the clip.
+    ap.add_argument("--clip-max-sec", type=float, default=15.0,
+                    help="scenes mode: clips at or under this run whole; "
+                         "longer ones are windowed into --seconds pieces")
     ap.add_argument("--max-seconds", type=float, default=0,
                     help="0 = whole video. Otherwise annotate only the first N "
                          "seconds -- for shakedown runs. Segment indices and "
@@ -1519,17 +1591,48 @@ def main():
     print(f"prompt:   {prompt_sha}", flush=True)
     print(f"writing:  {args.out}", flush=True)
 
-    clips = sorted(args.videos.glob("*.mp4"))
-    if args.only:
-        wanted = {s.strip() for s in args.only.split(",") if s.strip()}
-        clips = [c for c in clips if c.stem in wanted]
-        missing = wanted - {c.stem for c in clips}
-        if missing:
-            raise SystemExit(f"--only: no .mp4 for {sorted(missing)} under {args.videos}")
-    if args.limit:
-        clips = clips[: args.limit]
-    if not clips:
-        raise SystemExit(f"no .mp4 under {args.videos}")
+    # Stamped into every record and honoured by --resume. The two modes number
+    # segments differently over the SAME videos under the SAME prompt_sha --
+    # fixed windows 0-based on a 10s grid, splits 1-based on the edit points --
+    # so without this marker a scenes run would "resume" over old grid records
+    # (and vice versa) wherever the indices happen to overlap.
+    seg_mode = "scenes" if args.scenes else "fixed"
+
+    if args.scenes:
+        if not args.scenes.is_dir():
+            raise SystemExit(
+                f"--scenes: no such directory {args.scenes}\n"
+                f"  Produce splits first: "
+                f"scripts/32_split_scenes.py --only <video_id>")
+        vid_dirs = sorted(d for d in args.scenes.iterdir()
+                          if d.is_dir() and any(d.glob("split_*/clip.mp4")))
+        if args.only:
+            wanted = {s.strip() for s in args.only.split(",") if s.strip()}
+            vid_dirs = [d for d in vid_dirs if d.name in wanted]
+            missing = wanted - {d.name for d in vid_dirs}
+            if missing:
+                raise SystemExit(
+                    f"--only: no splits for {sorted(missing)} under "
+                    f"{args.scenes} -- run scripts/32_split_scenes.py first")
+        if args.limit:
+            vid_dirs = vid_dirs[: args.limit]
+        if not vid_dirs:
+            raise SystemExit(f"no <video_id>/split_NN/clip.mp4 under {args.scenes}")
+        clips = []          # unused in this mode; the loop below walks vid_dirs
+        print(f"segments: scene splits from {args.scenes} "
+              f"({len(vid_dirs)} video(s))", flush=True)
+    else:
+        clips = sorted(args.videos.glob("*.mp4"))
+        if args.only:
+            wanted = {s.strip() for s in args.only.split(",") if s.strip()}
+            clips = [c for c in clips if c.stem in wanted]
+            missing = wanted - {c.stem for c in clips}
+            if missing:
+                raise SystemExit(f"--only: no .mp4 for {sorted(missing)} under {args.videos}")
+        if args.limit:
+            clips = clips[: args.limit]
+        if not clips:
+            raise SystemExit(f"no .mp4 under {args.videos}")
 
     # Resume across ALL prior runs, not just one file -- but only honour records
     # written under the SAME prompt. A changed prompt makes old records stale,
@@ -1537,7 +1640,7 @@ def main():
     # and half another with nothing in the data to say which.
     done = set()
     if args.resume:
-        stale = other_model = 0
+        stale = other_model = other_seg = 0
         for prev in sorted(args.outdir.glob("annotations_*.jsonl")):
             with prev.open() as f:
                 for line in f:
@@ -1557,33 +1660,126 @@ def main():
                     if r.get("prompt_sha") != prompt_sha:
                         stale += 1
                         continue
+                    # A grid record and a split record can share (video_id,
+                    # segment_index) AND prompt_sha while describing different
+                    # stretches of the video. Records from before this field
+                    # existed are all grid runs, hence the "fixed" default.
+                    if (r.get("segmentation") or "fixed") != seg_mode:
+                        other_seg += 1
+                        continue
                     if r.get("parse_ok"):   # retry anything that failed to parse
                         done.add((r["video_id"], r["segment_index"]))
         print(f"resume:   {len(done)} done, {stale} stale (different prompt), "
-              f"{other_model} from other models (ignored)", flush=True)
+              f"{other_model} from other models, {other_seg} from the other "
+              f"segmentation (ignored)", flush=True)
 
+    # Work items are dicts because the two modes disagree about coordinates:
+    # start/end are always the ORIGINAL video's timeline (records, url_at,
+    # printed timestamps), ann_start/ann_end are what the model is handed. On
+    # the grid they are the same window of the same file; on a split they are
+    # 0..duration of a clip that was already cut out of the original.
     work, skipped = [], []
-    for clip in clips:
-        vid = clip.stem
-        info = meta.get(vid)
-        if info is None:
-            skipped.append(f"{vid} (not in manifest)")
-            continue
-        if not info["duration"]:
-            skipped.append(f"{vid} (no duration)")
-            continue
-        # --max-seconds caps the DURATION, which caps the number of windows.
-        # Segment indices are unaffected: a capped run produces exactly the
-        # first N segments of a full run, with the same indices, the same
-        # boundaries and the same prompt_sha. So a later full run resumes over
-        # the top of it rather than treating it as a different corpus.
-        duration = info["duration"]
-        if args.max_seconds:
-            duration = min(duration, args.max_seconds)
-        for i, (start, end) in enumerate(
-                segments(duration, args.seconds, args.min_tail)):
-            if (vid, i) not in done:
-                work.append((clip, vid, info["title"], info["url"], i, start, end))
+    if args.scenes:
+        for vd in vid_dirs:
+            vid = vd.name
+            info = meta.get(vid)
+            if info is None:
+                # Unlike the grid path this is not fatal: the split's meta.json
+                # carries its own boundaries, the manifest only adds title/url.
+                skipped.append(f"{vid} (not in manifest; no title/url)")
+                info = {"title": "", "url": ""}
+            for sd in sorted(vd.glob("split_*")):
+                clip = sd / "clip.mp4"
+                if not clip.is_file():
+                    continue
+                try:
+                    sm = json.loads((sd / "meta.json").read_text())
+                except (OSError, json.JSONDecodeError) as e:
+                    skipped.append(f"{vid}/{sd.name} (meta.json: {e})")
+                    continue
+                start, end = float(sm["start"]), float(sm["end"])
+                # Shakedown cap, scene-split semantics: only splits that START
+                # inside the first N seconds. Indices are the split's own, so a
+                # later uncapped run resumes over the top, same as the grid.
+                if args.max_seconds and start >= args.max_seconds:
+                    continue
+                try:
+                    i = int(sm["index"])
+                except (KeyError, TypeError, ValueError):
+                    i = int(sd.name.rsplit("_", 1)[1])
+                # encoded_duration is what ffprobe measured AFTER the cut's
+                # re-encode -- the ground truth about this file, where
+                # end-start is only the plan it was cut from.
+                dur = float(sm.get("encoded_duration")
+                            or sm.get("duration") or (end - start))
+                base = {
+                    "clip": clip, "vid": vid,
+                    "title": info["title"], "url": info["url"],
+                    "split": sd.name,
+                    "orig": Path(sm["source"]) if sm.get("source") else None,
+                }
+                # SEGMENT INDEX IS split*100 + part (0 = the whole clip).
+                # Composite ON PURPOSE: a windowed split emits several
+                # segments, and they need indices that (a) never collide with
+                # a neighbouring split's, (b) sort in video order, and (c) do
+                # not RENUMBER every later split when --clip-max-sec changes
+                # -- a sequential counter fails (c), and with it every
+                # already-annotated segment's resume key.
+                if dur <= args.clip_max_sec:
+                    if (vid, i * 100) in done:
+                        continue
+                    work.append({**base, "i": i * 100,
+                                 "start": start, "end": end,
+                                 "ann_start": 0.0, "ann_end": dur,
+                                 "part": None, "parts": None,
+                                 "cut_confidence": sm.get("cut_confidence")})
+                else:
+                    wins = segments(dur, args.seconds, args.min_tail)
+                    for p, (a, b) in enumerate(wins, 1):
+                        if (vid, i * 100 + p) in done:
+                            continue
+                        work.append({
+                            **base, "i": i * 100 + p,
+                            # Original-video coordinates for the record;
+                            # clip-local ones for the model.
+                            "start": start + a, "end": start + b,
+                            "ann_start": a, "ann_end": b,
+                            "part": p, "parts": len(wins),
+                            # Only the LAST window ends on the detector's cut;
+                            # interior joins are arbitrary and must not claim
+                            # its confidence (same rule as scripts/32).
+                            "cut_confidence": (sm.get("cut_confidence")
+                                               if p == len(wins) else None),
+                        })
+    else:
+        for clip in clips:
+            vid = clip.stem
+            info = meta.get(vid)
+            if info is None:
+                skipped.append(f"{vid} (not in manifest)")
+                continue
+            if not info["duration"]:
+                skipped.append(f"{vid} (no duration)")
+                continue
+            # --max-seconds caps the DURATION, which caps the number of windows.
+            # Segment indices are unaffected: a capped run produces exactly the
+            # first N segments of a full run, with the same indices, the same
+            # boundaries and the same prompt_sha. So a later full run resumes
+            # over the top of it rather than treating it as a different corpus.
+            duration = info["duration"]
+            if args.max_seconds:
+                duration = min(duration, args.max_seconds)
+            for i, (start, end) in enumerate(
+                    segments(duration, args.seconds, args.min_tail)):
+                if (vid, i) not in done:
+                    work.append({
+                        "clip": clip, "vid": vid,
+                        "title": info["title"], "url": info["url"],
+                        "i": i, "start": start, "end": end,
+                        "ann_start": start, "ann_end": end,
+                        "split": None, "part": None, "parts": None,
+                        "cut_confidence": None, "orig": None,
+                    })
 
     if skipped:
         print(f"SKIPPED {len(skipped)}: {', '.join(skipped[:5])}"
@@ -1596,7 +1792,7 @@ def main():
     # trace -- that spike is exactly what you want to see when sizing a model
     # against the cards you have.
     run = init_wandb(args, model_tag, backend, prompt_sha,
-                     sorted({w[1] for w in work}), len(work))
+                     sorted({w["vid"] for w in work}), len(work))
 
     asr = None
     if args.transcribe:
@@ -1618,7 +1814,9 @@ def main():
     table_rows = []
 
     with args.out.open("a") as fout:
-        for k, (clip, vid, title, url, i, start, end) in enumerate(work, 1):
+        for k, w in enumerate(work, 1):
+            clip, vid, i = w["clip"], w["vid"], w["i"]
+            start, end = w["start"], w["end"]
             t0 = time.time()
 
             # Transcription is timed INSIDE the segment, but the cache means
@@ -1628,7 +1826,21 @@ def main():
             prompt = PROMPT + (AUDIO_PROMPT if native_audio else "")
             if asr is not None:
                 try:
-                    transcript = asr.segment_text(clip, start, end)
+                    # Whisper the ORIGINAL video when the split still knows
+                    # where it lives: one ASR pass per video (the existing
+                    # per-video cache) instead of one per split, and the word
+                    # timeline matches start/end as recorded. The split file
+                    # itself is the fallback -- with an explicit cache id,
+                    # because every split is named clip.mp4 and the default
+                    # stem key would make all of them share one transcript.
+                    orig = w["orig"]
+                    if orig is not None and orig.is_file():
+                        transcript = asr.segment_text(orig, start, end)
+                    else:
+                        transcript = asr.segment_text(
+                            clip, w["ann_start"], w["ann_end"],
+                            cache_id=(f"{vid}__{w['split']}" if w["split"]
+                                      else None))
                     prompt = prompt + TRANSCRIPT_TEMPLATE.format(
                         transcript=transcript)
                 except Exception as e:
@@ -1639,7 +1851,8 @@ def main():
                     transcript = None
 
             try:
-                raw = annotator.annotate(clip, start, end, prompt)
+                raw = annotator.annotate(clip, w["ann_start"], w["ann_end"],
+                                         prompt)
             except Exception as e:
                 print(f"[{k}/{n}] FAIL {vid} seg {i}: {e}", flush=True)
                 continue
@@ -1666,12 +1879,26 @@ def main():
                 "elapsed_sec": round(dt, 2),
                 "prompt_sha": prompt_sha,
                 "video_id": vid,
-                "video_name": title,
-                "url": url,
+                "video_name": w["title"],
+                "url": w["url"],
                 # Deep link straight to this segment -- makes spot-checking an
-                # annotation a click instead of a scrub.
-                "url_at": f"{url}&t={int(start)}s",
+                # annotation a click instead of a scrub. start is the ORIGINAL
+                # video's timeline in both modes, so this works for splits too.
+                "url_at": (f"{w['url']}&t={int(start)}s" if w["url"] else None),
                 "video": str(clip),
+                # How this segment was delimited -- "fixed" (10s grid) or
+                # "scenes" (shot-boundary splits). The two number segments
+                # differently over the same video, so resume and 27's join
+                # must never pair records across modes.
+                "segmentation": seg_mode,
+                "split": w["split"],
+                # part/parts: which --seconds window of an over-long clip this
+                # is (null for a clip annotated whole). segment_index encodes
+                # the same thing as split*100+part -- these two exist so nobody
+                # has to decode that arithmetic to read a record.
+                "part": w["part"],
+                "parts": w["parts"],
+                "cut_confidence": w["cut_confidence"],
                 "segment_index": i,
                 "start_sec": round(start, 2),
                 "end_sec": round(end, 2),

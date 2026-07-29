@@ -52,10 +52,22 @@ FIELDS = ["num_infants", "num_adults", "num_children", "num_humans_total",
           "image_quality"]
 
 
-def load(outdir: Path, video: str, want_sha: str | None):
-    """-> ({model: {seg_index: record}}, prompt_shas seen, dropped count)."""
+def load(outdir: Path, video: str, want_sha: str | None,
+         want_seg: str | None = None):
+    """-> ({model: {seg_index: record}}, prompt_shas seen, segmentations seen,
+    dropped-for-prompt count, dropped-for-segmentation count).
+
+    want_seg filters on how segments were delimited -- "fixed" (10s grid) or
+    "scenes" (shot-boundary splits from scripts/32). The two number segments
+    DIFFERENTLY over the same video under the SAME prompt_sha: grid indices are
+    0-based 10s windows, split indices 1-based edit-point clips. Joining across
+    them on segment_index would compare answers about different stretches of
+    video and call the disagreement a model property. Records from before the
+    field existed are all grid runs, hence the "fixed" default.
+    """
     by_model = defaultdict(dict)
-    shas, dropped = set(), 0
+    shas, segs = set(), set()
+    dropped_sha = dropped_seg = 0
     for f in sorted(outdir.glob("annotations_*.jsonl")):
         with f.open() as fh:
             for line in fh:
@@ -68,13 +80,17 @@ def load(outdir: Path, video: str, want_sha: str | None):
                 if r.get("video_id") != video:
                     continue
                 shas.add(r.get("prompt_sha"))
+                segs.add(r.get("segmentation") or "fixed")
+                if want_seg and (r.get("segmentation") or "fixed") != want_seg:
+                    dropped_seg += 1
+                    continue
                 if want_sha and r.get("prompt_sha") != want_sha:
-                    dropped += 1
+                    dropped_sha += 1
                     continue
                 # Files are read in name order and later records overwrite
                 # earlier ones, so a re-run of a segment wins over the original.
                 by_model[r.get("model", LEGACY_MODEL_TAG)][r["segment_index"]] = r
-    return by_model, shas, dropped
+    return by_model, shas, segs, dropped_sha, dropped_seg
 
 
 def fmt(r, field):
@@ -95,6 +111,14 @@ def main():
     ap.add_argument("--prompt-sha", default=None,
                     help="only compare records under this prompt hash "
                          "(default: the most common one present)")
+    ap.add_argument("--segmentation", default="auto",
+                    choices=["auto", "fixed", "scenes"],
+                    help="which segmentation's records to compare: 'fixed' "
+                         "(10s grid) or 'scenes' (shot-boundary splits). "
+                         "'auto' picks the most common one present. Unlike "
+                         "prompt hashes the two are NEVER mixed: their "
+                         "segment indices describe different stretches of "
+                         "the video.")
     ap.add_argument("--strict-prompt", action="store_true",
                     help="drop every record whose prompt hash is not the "
                          "dominant one. Off by default so Qwen3-Omni, whose "
@@ -124,16 +148,41 @@ def main():
 
     # Pick the dominant prompt hash first, then reload filtered to it. Comparing
     # across prompts silently would be comparing answers to different questions.
-    probe, shas, _ = load(args.outdir, args.video, None)
+    # seg_modes, not "segs": that name is taken further down for the joined
+    # SEGMENT INDICES, and shadowing it here invites exactly the confusion
+    # this filter exists to prevent.
+    probe, shas, seg_modes, _, _ = load(args.outdir, args.video, None)
     if not probe:
         raise SystemExit(f"no records for video {args.video} in {args.outdir}")
+
+    # Segmentation is resolved BEFORE the prompt hash and filtered HARD. Grid
+    # and split records coexist for the same video under the same prompt (the
+    # prompt did not change; how the video was diced did), and their
+    # segment_index spaces overlap without corresponding.
+    if args.segmentation != "auto":
+        seg = args.segmentation
+    else:
+        seg_counts = defaultdict(int)
+        for recs in probe.values():
+            for r in recs.values():
+                seg_counts[r.get("segmentation") or "fixed"] += 1
+        seg = max(seg_counts, key=seg_counts.get)
+    if len(seg_modes) > 1:
+        print(f"NOTE: both segmentations present for {args.video}; comparing "
+              f"'{seg}' only (--segmentation to pick the other)\n",
+              file=sys.stderr)
+
     if args.prompt_sha:
         sha = args.prompt_sha
     else:
         counts = defaultdict(int)
         for recs in probe.values():
             for r in recs.values():
+                if (r.get("segmentation") or "fixed") != seg:
+                    continue   # the other segmentation must not vote
                 counts[r.get("prompt_sha")] += 1
+        if not counts:
+            raise SystemExit(f"no '{seg}' records for {args.video}")
         sha = max(counts, key=counts.get)
 
     # Qwen3-Omni's prompt carries an audio addendum, so its prompt_sha differs
@@ -143,8 +192,11 @@ def main():
     # comparison over it. The audio-vs-video question is the reason Omni is in
     # the list at all, so mixed prompts are allowed by default and the shared
     # fields are compared; --strict-prompt restores hash-exact filtering.
-    by_model, _, dropped = load(args.outdir, args.video,
-                                sha if args.strict_prompt else None)
+    by_model, _, _, dropped, dropped_seg = load(
+        args.outdir, args.video, sha if args.strict_prompt else None, seg)
+    if dropped_seg:
+        print(f"NOTE: ignored {dropped_seg} record(s) from the other "
+              f"segmentation (comparing only '{seg}')\n", file=sys.stderr)
     if dropped:
         print(f"NOTE: ignored {dropped} record(s) under a different prompt "
               f"hash (comparing only {sha})\n", file=sys.stderr)
@@ -283,11 +335,11 @@ def main():
 
     # ---- wandb -------------------------------------------------------------
     if args.wandb:
-        log_to_wandb(args, sha, models, segs, rows, health, agree_rows, fields,
+        log_to_wandb(args, sha, seg, models, segs, rows, health, agree_rows, fields,
                      field)
 
 
-def log_to_wandb(args, sha, models, segs, rows, health, agree_rows, fields,
+def log_to_wandb(args, sha, seg, models, segs, rows, health, agree_rows, fields,
                  field):
     """One run per comparison, in the SAME group as the per-model runs.
 
@@ -317,6 +369,7 @@ def log_to_wandb(args, sha, models, segs, rows, health, agree_rows, fields,
         group=args.video,
         job_type="compare",
         config={"video": args.video, "prompt_sha": sha, "models": models,
+                "segmentation": seg,
                 "n_segments": len(segs), "fields": fields},
     )
 

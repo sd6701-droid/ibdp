@@ -41,6 +41,9 @@ missing.txt
 # ViTPose overlay clips + keypoint JSON pulled from the cluster
 pose_videos/
 
+# Local scene-split test output (scripts/32) -- clips, wavs, thumbs, meta
+test_data_splits/
+
 # Explicit opt-in for synthetic / example assets only
 !examples/assets/**
 !docs/**/*.png

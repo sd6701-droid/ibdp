@@ -65,4 +65,8 @@ mkdir -p "$ROOT/outputs/logs"
 echo "node=$(hostname) gpus=${SLURM_GPUS_ON_NODE:-?} job=${SLURM_JOB_ID:-?}"
 echo "args: $*"
 
-srun python scripts/26_describe_segments_hf.py "$@"
+# NO srun: single-task job, and srun inherits SLURM_CPU_BIND from a parent
+# job when this was submitted from inside an interactive allocation -- then
+# dies on the new node with "CPU binding outside of job step allocation".
+# (Same fix as 32_split_scenes.sbatch, where this actually happened.)
+python scripts/26_describe_segments_hf.py "$@"

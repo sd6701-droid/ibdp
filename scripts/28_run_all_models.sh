@@ -5,6 +5,12 @@
 #   scripts/28_run_all_models.sh 0HkcGRBsPUM
 #   scripts/28_run_all_models.sh 0HkcGRBsPUM --limit-segments 3   # quick shakedown
 #   MODELS="InternVL3-38B Qwen2.5-VL-72B-Instruct" scripts/28_run_all_models.sh VID
+#   SCENES=1 scripts/28_run_all_models.sh 8yDn1uFbs4s   # annotate scripts/32's
+#                                                       # shot-boundary splits
+#                                                       # instead of a 10s grid
+#   SCENES=1 scripts/28_run_all_models.sh all           # every video that has
+#                                                       # splits, one W&B run
+#                                                       # per model, NO compare
 #
 # SEQUENTIAL ON PURPOSE. 145GB + 156GB of weights do not coexist on 240GB of
 # VRAM, and backgrounding them with & buys nothing anyway: one model already
@@ -59,6 +65,32 @@ MODELS="${MODELS:-Qwen3-VL-30B-A3B-Instruct Qwen3-Omni-30B-A3B-Instruct Qwen3-VL
 # mixing two modalities in one file.
 AUDIO="${AUDIO:-0}"
 
+# --- Scene splits ------------------------------------------------------------
+# SCENES=1 annotates the shot-boundary splits made by scripts/32_split_scenes.py
+# (outputs/scenes/<video>/split_NN/clip.mp4) instead of cutting a fixed 10s
+# grid over the full video: one segment per source clip, boundaries on the
+# compilation's own edit points. SCENES=<path> points at a different splits
+# tree. Default off, so existing grid workflows are untouched.
+#
+# Records carry segmentation="scenes" and NEVER resume into grid records (or
+# vice versa) even though the prompt -- and therefore prompt_sha -- is
+# identical: the two modes number different stretches of the same video with
+# overlapping indices. The compare step below is pinned to the same mode for
+# the same reason.
+#
+# Splits are annotated WHOLE -- one forward pass per source clip. Only a clip
+# longer than 15s (--clip-max-sec) is windowed into 10s (--seconds) pieces.
+# MAX_SECONDS still works if set explicitly ("only splits starting inside the
+# first N seconds"), but unlike grid mode it defaults to OFF here: the splits
+# are already few and short, so a full pass IS the cheap pass.
+SCENES="${SCENES:-0}"
+SCENES_DIR=""
+if [[ "$SCENES" == "1" ]]; then
+  SCENES_DIR="$ROOT/outputs/scenes"
+elif [[ "$SCENES" != "0" ]]; then
+  SCENES_DIR="$SCENES"
+fi
+
 # --- Shakedown window ------------------------------------------------------
 # Annotate only the first MAX_SECONDS of the video. 20s at the default 10s
 # window is 2 segments per model -- under a minute of inference each, against
@@ -72,7 +104,16 @@ AUDIO="${AUDIO:-0}"
 #
 # Segment indices match a full run, so the capped records are the genuine first
 # two and a later MAX_SECONDS=0 run resumes over the top of them.
-MAX_SECONDS="${MAX_SECONDS:-20}"
+#
+# SCENES MODE DEFAULTS TO 0 (whole video): scene splits are already the cheap
+# unit of work -- a 220s video is ~26 clips of ~8s -- and capping them to the
+# first 20s would annotate two clips and look like a finished run. An explicit
+# MAX_SECONDS=N still wins in either mode.
+if [[ -n "$SCENES_DIR" ]]; then
+  MAX_SECONDS="${MAX_SECONDS:-0}"
+else
+  MAX_SECONDS="${MAX_SECONDS:-20}"
+fi
 
 VIDEO="${1:-}"
 shift 2>/dev/null || true
@@ -239,6 +280,28 @@ except ImportError:
 PY
 fi
 
+# VIDEO=all: every video with splits, in one pass per model. Scenes mode only
+# -- "all" on the 10s grid would be the entire 195-video corpus, which is an
+# array-job problem, not a for-loop one.
+if [[ "$VIDEO" == "all" && -z "$SCENES_DIR" ]]; then
+  echo "ERROR: 'all' needs SCENES mode -- SCENES=1 $0 all" >&2
+  exit 2
+fi
+
+# Splits must exist BEFORE a 60-150GB model is loaded to discover they don't.
+if [[ -n "$SCENES_DIR" ]]; then
+  pat="$SCENES_DIR/$VIDEO/split_*/clip.mp4"
+  [[ "$VIDEO" == "all" ]] && pat="$SCENES_DIR/*/split_*/clip.mp4"
+  if ! compgen -G "$pat" > /dev/null; then
+    echo "ERROR: SCENES mode, but no splits matching $pat" >&2
+    echo "       Cut them first (seconds of GPU, minutes of ffmpeg):" >&2
+    echo "         sbatch scripts/32_split_scenes.sbatch --only $VIDEO --wav --thumbs" >&2
+    exit 1
+  fi
+  n_splits=$(compgen -G "$pat" | wc -l | tr -d ' ')
+  n_vids=$(compgen -G "$pat" | sed 's|/split_[^/]*/clip.mp4||' | sort -u | wc -l | tr -d ' ')
+fi
+
 # --transcribe loads Whisper from disk like everything else here.
 if [[ "$AUDIO" == "1" ]]; then
   [[ -d "$ROOT/models/whisper-large-v3" ]] || {
@@ -277,6 +340,13 @@ fi
 
 echo
 echo "video  : $VIDEO"
+if [[ "$VIDEO" == "all" ]]; then
+  echo "segments: $n_splits scene splits across $n_vids videos under $SCENES_DIR"
+elif [[ -n "$SCENES_DIR" ]]; then
+  echo "segments: $n_splits scene splits from $SCENES_DIR/$VIDEO"
+else
+  echo "segments: fixed 10s grid over the full video"
+fi
 echo "models : $MODELS"
 echo "audio  : $([[ "$AUDIO" == "1" ]] && echo "transcript in prompt (Omni: native)" || echo "off (video only)")"
 if [[ "${MAX_SECONDS:-0}" != "0" ]]; then
@@ -324,10 +394,20 @@ for M in $MODELS; do
     RESUME_ARG=()
   fi
 
+  declare -a SCENES_ARG=()
+  if [[ -n "$SCENES_DIR" ]]; then
+    SCENES_ARG=(--scenes "$SCENES_DIR")
+  fi
+
+  # VIDEO=all: no --only, so scripts/26 walks every video dir under --scenes.
+  declare -a ONLY_ARG=(--only "$VIDEO")
+  [[ "$VIDEO" == "all" ]] && ONLY_ARG=()
+
   python scripts/26_describe_segments_hf.py \
       --model "$ROOT/models/$M" \
-      --only "$VIDEO" \
+      ${ONLY_ARG[@]+"${ONLY_ARG[@]}"} \
       --outdir "$OUTDIR" \
+      ${SCENES_ARG[@]+"${SCENES_ARG[@]}"} \
       ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
       ${LIMIT_ARG[@]+"${LIMIT_ARG[@]}"} \
       ${AUDIO_ARGS[@]+"${AUDIO_ARGS[@]}"} \
@@ -351,6 +431,15 @@ echo "ran ${#OK_MODELS[@]} ok, ${#BAD_MODELS[@]} failed, in $(( (SECONDS - t_all
 # ---------------------------------------------------------------------------
 # Compare
 # ---------------------------------------------------------------------------
+# 27 compares ONE video's records; an all-videos sweep skips it rather than
+# pretending. The per-video command is printed so it is a paste, not a hunt.
+if [[ "$VIDEO" == "all" ]]; then
+  echo
+  echo "no comparison for an all-videos sweep. Per video, when you want one:"
+  echo "  python scripts/27_compare_models.py --outdir $OUTDIR --video <VIDEO_ID> \\"
+  echo "      --segmentation scenes --csv $OUTDIR/compare_<VIDEO_ID>.csv"
+  exit 0
+fi
 if [[ ${#OK_MODELS[@]} -lt 2 ]]; then
   echo "fewer than 2 models produced output -- nothing to compare." >&2
   exit 1
@@ -375,8 +464,13 @@ done
 # step's logging here -- it is the only thing that logs in that mode.
 [[ "$WANDB_TABLES_ONLY" == "1" ]] && CMP_WANDB=(--wandb)
 
+# Pinned to THIS sweep's segmentation, not left to 27's majority vote: with
+# grid records already on disk for the same video, "most common" would be the
+# OLD mode until a scenes sweep out-produces it -- and the comparison would
+# quietly describe the wrong run.
 python scripts/27_compare_models.py \
     --outdir "$OUTDIR" --video "$VIDEO" --models "$joined" --csv "$csv" \
+    --segmentation "$([[ -n "$SCENES_DIR" ]] && echo scenes || echo fixed)" \
     ${CMP_WANDB[@]+"${CMP_WANDB[@]}"} \
     2>&1 | tee "$txt"
 
