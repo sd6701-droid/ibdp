@@ -304,7 +304,7 @@ def log_to_wandb(args, sha, models, segs, rows, health, agree_rows, fields,
 
     run = wandb.init(
         project=args.wandb_project,
-        name=f"compare--{args.video}",
+        name=os.environ.get("WANDB_NAME", f"compare--{args.video}"),
         group=args.video,
         job_type="compare",
         config={"video": args.video, "prompt_sha": sha, "models": models,
@@ -403,9 +403,10 @@ def log_to_wandb(args, sha, models, segs, rows, health, agree_rows, fields,
         if sec is not None:
             summary[f"model/{m}/sec_per_segment"] = sec
     run.summary.update(summary)
+    run_name = run.name
     run.finish()
 
-    print(f"\nwandb: logged comparison as run compare--{args.video}")
+    print(f"\nwandb: logged comparison as run {run_name}")
     if os.environ.get("WANDB_MODE") == "offline":
         print(f"  sync from a login node:  wandb sync "
               f"{args.wandb_dir or args.outdir}/wandb/offline-run-*")
