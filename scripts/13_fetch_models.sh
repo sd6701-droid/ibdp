@@ -35,6 +35,7 @@ LOG_DIR="$MODELS/_logs"
 
 # key|repo_id|local dirname|approx GB|A100-80s needed at bf16|note
 REGISTRY="
+qwen3-vl-32b|Qwen/Qwen3-VL-32B-Instruct|Qwen3-VL-32B-Instruct|64|2|DENSE 32B, same gen as the 30B-A3B baseline
 qwen25-vl-72b|Qwen/Qwen2.5-VL-72B-Instruct|Qwen2.5-VL-72B-Instruct|145|4|qwen_vl_utils works as-is
 internvl3-78b|OpenGVLab/InternVL3-78B|InternVL3-78B|156|4|needs trust_remote_code + new video path
 internvl3-38b|OpenGVLab/InternVL3-38B|InternVL3-38B|76|2|needs trust_remote_code + new video path

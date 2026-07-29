@@ -28,6 +28,7 @@ LOGDIR="$OUTDIR/logs"
 #
 #   Qwen3-VL-30B-A3B-Instruct   ~61GB   MoE, only ~3.3B params active per token
 #   Qwen3-Omni-30B-A3B-Instruct ~71GB   MoE, NATIVE AUDIO + video
+#   Qwen3-VL-32B-Instruct       ~64GB   DENSE, same generation as the baseline
 #   InternVL3-38B               ~76GB   dense
 #   Qwen2.5-VL-72B-Instruct    ~145GB   dense, older generation than Qwen3-VL
 #   InternVL3-78B              ~156GB   dense
@@ -40,7 +41,13 @@ LOGDIR="$OUTDIR/logs"
 # Qwen3-Omni sits directly after it ON PURPOSE. Same family, same MoE size, so
 # the pair isolates ONE variable: does hearing the clip beat only seeing it?
 # Any other ordering confounds that with a size or generation difference.
-MODELS="${MODELS:-Qwen3-VL-30B-A3B-Instruct Qwen3-Omni-30B-A3B-Instruct InternVL3-38B Qwen2.5-VL-72B-Instruct InternVL3-78B}"
+#
+# Qwen3-VL-32B comes next, and is the OTHER controlled pair: same generation and
+# roughly the same nominal size as the 30B-A3B baseline, but DENSE -- 32B active
+# per token against 3.3B. If dense-vs-MoE is worth anything on this task, that
+# is the pair that shows it, uncontaminated by a generation gap the way
+# Qwen2.5-VL-72B is.
+MODELS="${MODELS:-Qwen3-VL-30B-A3B-Instruct Qwen3-Omni-30B-A3B-Instruct Qwen3-VL-32B-Instruct InternVL3-38B Qwen2.5-VL-72B-Instruct InternVL3-78B}"
 
 # --- Audio ------------------------------------------------------------------
 # AUDIO=1 gives the four video-only models a Whisper transcript in the prompt.
