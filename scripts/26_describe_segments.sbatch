@@ -53,6 +53,14 @@ export HF_HOME=$ROOT/.hf
 export HF_HUB_OFFLINE=1               # no network on compute; fail fast, don't hang
 export FORCE_QWENVL_VIDEO_READER=torchcodec
 
+# sbatch exports the SUBMITTING shell's environment, and some login shells
+# carry an LD_PRELOADed NVBLAS/UCX shim from an HPC module. Inside the job the
+# shim is misconfigured (no nvblas.conf), fails every BLAS call
+#   [NVBLAS] cublasXtSgemm failed with error=1
+# and contributed to NaN audio features on the Omni run. Drop it: nothing in
+# this pipeline wants a BLAS interposer.
+unset LD_PRELOAD
+
 # InternVL shards across cards via device_map="auto"; without this a fragmented
 # 156GB load can trip allocator OOM even when the free VRAM total is sufficient.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

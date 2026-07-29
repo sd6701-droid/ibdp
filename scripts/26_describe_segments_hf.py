@@ -767,7 +767,21 @@ class QwenOmniAnnotator:
         else:
             seg = self._cut(clip, start, end)
         try:
-            raw = self._generate(seg, prompt, use_audio=True)
+            # SEGFAULT GUARD. qwen_omni_utils loads the clip's audio through
+            # librosa's audioread fallback (soundfile cannot open mp4), and on
+            # rare clips that native decode SEGFAULTS -- reproducibly: seg 602
+            # of 0HkcGRBsPUM killed two runs on two different nodes at the
+            # same spot. A segfault is not an exception; it takes the process
+            # and every queued segment with it. So decode the audio once in a
+            # THROWAWAY subprocess first: if that child dies, this process
+            # survives and the segment is answered video-only, marked as such.
+            use_audio = self._audio_decodes_safely(seg)
+            if not use_audio:
+                print("      audio decode crashed/failed in probe subprocess "
+                      "-- annotating video-only", flush=True)
+                self.audio_dropped += 1
+
+            raw = self._generate(seg, prompt, use_audio=use_audio)
 
             # NaN RECOVERY. '!!!!!!' is token 0 repeated, which is argmax over
             # all-NaN logits. The NaN originates in the audio path: a silent or
@@ -782,7 +796,7 @@ class QwenOmniAnnotator:
             # a partial answer is never mistaken for a heard one. If it is still
             # degenerate the cause is not audio, and --attn-impl eager is the
             # next thing to try.
-            if is_degenerate(raw):
+            if use_audio and is_degenerate(raw):
                 print("      degenerate (NaN) with audio -- retrying "
                       "video-only", flush=True)
                 retry = self._generate(seg, prompt, use_audio=False)
@@ -798,6 +812,31 @@ class QwenOmniAnnotator:
             # scripts/32 spent minutes producing.
             if seg is not clip:
                 seg.unlink(missing_ok=True)
+
+    def _audio_decodes_safely(self, seg: Path) -> bool:
+        """Decode seg's audio the same way qwen_omni_utils will -- but in a
+        subprocess, where a native-decoder SEGFAULT kills the child and not
+        the run.
+
+        librosa.load on an mp4 goes soundfile (fails on mp4) -> audioread ->
+        a native decode that crashed twice on the same clip window (seg 602 of
+        0HkcGRBsPUM), on different nodes, at address (nil). The probe mirrors
+        that exact path (16kHz mono is what the Omni feature extractor asks
+        for), so a clip that passes here is a clip the real load survives.
+
+        Any child failure -- signal, non-zero exit, hang past the timeout --
+        reads as "do not feed this audio to the model". The cost is a python
+        + librosa startup (~2-4s) per segment, which the run pays gladly: the
+        alternative was one clip killing every segment behind it."""
+        code = ("import sys, librosa; "
+                "librosa.load(sys.argv[1], sr=16000, mono=True); "
+                "print('ok')")
+        try:
+            p = subprocess.run([sys.executable, "-c", code, str(seg)],
+                               capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            return False
+        return p.returncode == 0
 
     def _generate(self, seg: Path, prompt: str, use_audio: bool) -> str:
         """One forward pass over an already-cut segment.
