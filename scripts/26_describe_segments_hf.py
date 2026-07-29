@@ -112,51 +112,43 @@ LEGACY_MODEL_TAG = "Qwen3-VL-30B-A3B-Instruct"
 # "infant" is defined explicitly. Left to itself the model drifts between
 # "baby", "toddler" and "young child" across segments, which makes the counts
 # useless to aggregate.
-PROMPT = """Analyse this clip. Reply with JSON only.
-
-Sort EVERY visible person into exactly one bucket; omit nobody:
-- INFANT: cannot walk unaided (crawls, sits, lies, is carried).
-- CHILD: walks unaided, not yet an adult.
-- ADULT: grown person.
-
-{
-  "has_infant": bool,
-  "num_infants": int,
-  "num_children": int,
-  "has_adult": bool,
-  "num_adults": int,
-  "num_humans_total": int,
-  "infant_visibility": "full_body" | "partial_body" | "not_visible",
-  "visible_infant_parts": ["head","face","torso","arms","hands","legs","feet"],
-  "location": "indoor" | "outdoor" | "vehicle",
-  "surface": "floor" | "rug_or_mat" | "bed" | "sofa" | "crib" | "highchair" | "held_by_person" | "grass" | "other" | "not_visible",
-  "camera_distance": "close_up" | "medium" | "wide",
-  "lighting": "bright" | "normal" | "dim",
-  "infant_clothing": "fully_clothed" | "partially_clothed" | "diaper_only" | "unclothed" | "not_visible",
-  "objects": ["up to 5 short noun phrases"],
-  "background_complexity": "minimal" | "moderate" | "cluttered",
-  "camera_motion": "static" | "shaky" | "panning" | "moving",
-  "image_quality": "good" | "fair" | "poor",
-  "description": "at most 2 sentences"
-}
-
-- Count distinct people across the whole clip, not per frame.
-- num_humans_total = num_infants + num_children + num_adults.
-- full_body = whole infant head-to-feet seen at some point; partial_body = only
-  part of them; not_visible = no infant, and then parts is [].
-- surface: what the infant is mainly on or in; "held_by_person" if carried.
-  surface and infant_clothing are "not_visible" when there is no infant.
-- camera_distance: close_up = one person fills the frame; wide = whole room or
-  scene visible.
-- camera_motion: static = fixed camera; shaky = handheld wobble; panning =
-  deliberate sweep; moving = camera travels through the scene.
-- objects: at most 5 objects the people interact with or that are near the
-  infant, short noun phrases ("toy car", "bottle"); [] if none.
-- background_complexity: minimal = bare walls/floor; cluttered = many items.
-- image_quality: poor = blur, heavy compression, or too dark to judge people.
-- description: max 2 sentences, concrete and specific -- who, where, what they
-  physically do, what they touch. Name the infant's posture. Only what is
-  visible; no mood, no padding, no repetition."""
+PROMPT = """Analyze the entire video clip and return only one valid JSON object. 
+ Do not include Markdown, explanations, confidence scores, or text outside the JSON.
+ Classify every distinct visible person exactly once across the entire clip: INFANT = cannot walk independently and may crawl, sit, lie, stand with support, or be carried;
+ CHILD = non-adult who can walk independently; ADULT = visibly grown person.
+ Count only real visible people, not voices, shadows, photos, posters, reflections that cannot be classified, or people on screens. 
+ Return this schema: 
+    {
+        "has_infant":bool,
+        "num_infants":int,
+        "num_children":int,
+        "has_adult":bool,
+        "num_adults":int,
+        "num_humans_total":int,
+        "infant_visibility":"full_body|partial_body|not_visible",
+        "visible_infant_parts":["head","face","torso","arms","hands","legs","feet"],
+        "location":"indoor|outdoor|vehicle",
+        "surface":"floor|rug_or_mat|bed|sofa|crib|highchair|held_by_person|grass|other|not_visible",
+        "camera_distance":"close_up|medium|wide",
+        "lighting":"bright|normal|dim",
+        "infant_clothing":"fully_clothed|partially_clothed|diaper_only|unclothed|not_visible",
+        "objects":["up to 5 short noun phrases"],
+        "background_complexity":"minimal|moderate|cluttered",
+        "camera_motion":"static|shaky|panning|moving",
+        "image_quality":"good|fair|poor",
+        "description":"maximum 2 sentences"
+        }. 
+        Rules: num_humans_total must equal num_infants + num_children + num_adults.
+        has_infant must equal num_infants > 0, and has_adult must equal num_adults > 0. 
+        full_body means at least one infant is visible from head to feet at some point; 
+        partial_body means an infant is visible but never fully from head to feet; 
+        not_visible means no infant is visible. When no infant is visible, set visible_infant_parts to [], surface to "not_visible", and infant_clothing to "not_visible". 
+        Include each visible infant body part only once. Surface means where the infant spends most of the visible clip; 
+        use held_by_person when mainly carried. close_up means one person fills most of the frame, 
+        medium means people and some surroundings are visible, and wide means most of the room or scene is visible. 
+        static means fixed camera, shaky means handheld wobble, panning means a deliberate sweep from a mostly fixed position, and moving means the camera travels through the scene. 
+        Objects must contain at most five short noun phrases for items touched by people or immediately near the infant; use [] when none are clearly visible. 
+        Description must state only visible facts, including who is present, the location, the infant's posture or movement, and objects being touched."""
 
 VALID_VISIBILITY = {"full_body", "partial_body", "not_visible"}
 VALID_PARTS = {"head", "face", "torso", "arms", "hands", "legs", "feet"}
