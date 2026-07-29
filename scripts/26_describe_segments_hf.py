@@ -591,7 +591,11 @@ class QwenOmniAnnotator:
             dtype="auto",
             device_map={"": 0} if single_card else "auto",
             enable_audio_output=False,
-            attn_implementation="sdpa")
+            # sdpa is the fast default, but it is also where the NaN comes from
+            # when a segment degenerates to '!!!!!!' -- eager is slower and
+            # numerically steadier. Overridable rather than switched outright,
+            # because most segments are fine on sdpa and eager costs real time.
+            attn_implementation=args.attn_impl)
         self.model.eval()
         if getattr(self.model, "has_talker", False):
             # Belt and braces: if a future config ignores the kwarg, drop it
@@ -990,7 +994,11 @@ def table_columns(audio: bool) -> list:
     """Columns for the per-segment results table. Audio columns only when the
     model heard the clip -- an empty audio column on a video-only run reads as
     "heard nothing", the same trap as a null field in the JSONL."""
-    cols = ["segment", "timestamp", "url_at", "parse_ok",
+    # "model" first, and present even though each model logs to its own
+    # <model>/results key: the key is lost the moment a table is exported to
+    # CSV or two tables are concatenated, and a row that cannot say who wrote it
+    # is unusable for exactly the comparison this table exists to support.
+    cols = ["model", "segment", "timestamp", "url_at", "parse_ok",
             "num_infants", "num_children", "num_adults", "num_humans_total",
             "infant_visibility", "visible_parts", "inconsistent",
             "description"]
@@ -1005,7 +1013,10 @@ def table_row(rec: dict, ann: dict, audio: bool) -> list:
     """One row, ordered to match table_columns(). Lists are joined to strings:
     W&B renders a Python list as its repr, which is unreadable in a cell and
     cannot be filtered on."""
-    row = [rec["segment_index"], rec["timestamp"], rec["url_at"],
+    # rec already carries the tag written into every JSONL record, so the table
+    # and the file on disk cannot drift apart on who produced a row.
+    row = [rec.get("model", ""),
+           rec["segment_index"], rec["timestamp"], rec["url_at"],
            bool(ann.get("parse_ok")),
            ann.get("num_infants"), ann.get("num_children"),
            ann.get("num_adults"), ann.get("num_humans_total"),
@@ -1026,7 +1037,10 @@ def table_row(rec: dict, ann: dict, audio: bool) -> list:
     return row
 
 
-def log_table(run, rows: list, audio: bool):
+_ANNOUNCED_TABLE_KEYS = set()
+
+
+def log_table(run, rows: list, audio: bool, model_tag: str = None):
     """Log the accumulated rows as a fresh wandb.Table.
 
     REBUILT each time rather than mutating one long-lived Table: W&B treats a
@@ -1037,11 +1051,60 @@ def log_table(run, rows: list, audio: bool):
     and, as of the last run, a segfault on the final segment. A table logged
     only on clean exit is a table you never get for the runs you most want to
     inspect.
+
+    KEY IS NAMESPACED IN SHARED-RUN MODE. When 28_run_all_models.sh points every
+    model at one W&B run, a fixed "results" key means each model overwrites the
+    previous one: six models in, one table out, with nothing to indicate the
+    other five were lost. It matters most for Qwen3-Omni, whose table carries
+    five audio columns the video-only models do not have -- colliding those two
+    schemas on one key is how you get a table that is wrong rather than merely
+    incomplete.
     """
     if run is None:
         return
     import wandb
-    run.log({"results": wandb.Table(columns=table_columns(audio), data=rows)})
+
+    cols = table_columns(audio)
+    # WIDTH GUARD. A row that does not match the header renders as an empty
+    # cell, not an error -- which is how a full table of 22 rows displayed as 22
+    # rows of dashes. Fail loudly here instead of shipping a table that looks
+    # populated and is not.
+    wrong = [i for i, r in enumerate(rows) if len(r) != len(cols)]
+    if wrong:
+        print(f"wandb: WARNING {len(wrong)} of {len(rows)} rows have "
+              f"{len(rows[wrong[0]])} values for {len(cols)} columns "
+              f"(audio={audio}) -- dropping them.", flush=True)
+        rows = [r for i, r in enumerate(rows) if i not in set(wrong)]
+
+    key = (f"{model_tag}/results"
+           if model_tag and os.environ.get("WANDB_RUN_ID") else "results")
+
+    # Say WHERE the table went, once per key. Without this the only way to find
+    # out a table landed under <model>/results rather than results is to hunt
+    # through the W&B UI -- and an empty panel looks identical to "the model
+    # never logged", which is a different bug entirely.
+    if key not in _ANNOUNCED_TABLE_KEYS:
+        _ANNOUNCED_TABLE_KEYS.add(key)
+        print(f"wandb:    table -> {key}  ({len(cols)} columns)", flush=True)
+
+    run.log({key: wandb.Table(columns=cols, data=rows)})
+
+
+def is_degenerate(raw: str, min_len: int = 40) -> bool:
+    """True when the output is a single character repeated -- '!!!!!!!!...'.
+
+    THIS IS NOT A FORMATTING MISTAKE. Greedy decoding takes the argmax of the
+    logit distribution; when those logits are NaN, argmax returns index 0, and
+    token 0 in Qwen's vocabulary is '!'. So a wall of exclamation marks means
+    the forward pass produced NaN -- an fp/attention problem, not a prompt one.
+
+    Worth separating from a real parse failure because the fixes are opposite:
+    a truncated JSON wants MORE tokens, a NaN wants a different attention
+    implementation or dtype. Lumping them together sends you to the prompt when
+    the problem is numerical.
+    """
+    s = raw.strip()
+    return len(s) >= min_len and len(set(s)) == 1
 
 
 def hhmmss(seconds: float) -> str:
@@ -1228,6 +1291,11 @@ def main():
     # stops a long tail window from quietly becoming an OOM.
     ap.add_argument("--max-frames", type=int, default=32)
     ap.add_argument("--internvl-tile", type=int, default=448)
+    ap.add_argument("--attn-impl", default="sdpa",
+                    choices=["sdpa", "eager", "flash_attention_2"],
+                    help="Qwen3-Omni attention kernel. Use 'eager' if segments "
+                         "come back as '!!!!!!' -- that is NaN logits, and "
+                         "eager is numerically steadier (and slower).")
     ap.add_argument("--wandb", action="store_true",
                     help="log GPU usage + per-segment metrics to Weights & Biases")
     ap.add_argument("--wandb-project", default="ibdp")
@@ -1260,6 +1328,16 @@ def main():
     # strictly larger question than one that does not, so the two must not
     # resume into each other either.
     native_audio = backend == "qwen-omni"
+
+    # The audio schema adds five keys on top of the twelve video ones, and the
+    # 256 default was sized for the video-only answer. Segments came back as
+    # valid JSON cut off mid-"description", which parses as nothing at all --
+    # the counts are lost along with the prose. Only bumped when the default
+    # was left untouched, so an explicit --max-new-tokens still wins.
+    if native_audio and args.max_new_tokens == 256:
+        args.max_new_tokens = 384
+        print(f"note:     --max-new-tokens raised to {args.max_new_tokens} for "
+              f"the audio schema (5 extra fields)", flush=True)
     prompt_sha = hashlib.sha256(
         (PROMPT
          + (TRANSCRIPT_TEMPLATE if args.transcribe else "")
@@ -1416,6 +1494,10 @@ def main():
                 continue
 
             ann = parse_annotation(raw, audio=native_audio)
+            # Recorded on the annotation itself, so a corpus can be filtered on
+            # "the model broke" separately from "the model answered badly".
+            if not ann["parse_ok"] and is_degenerate(raw):
+                ann["degenerate"] = True
             if ann["parse_ok"]:
                 ok += 1
             else:
@@ -1491,11 +1573,18 @@ def main():
                 # the UI. Every row is already safe in the JSONL; this is about
                 # being able to READ them without sshing in.
                 if k % args.wandb_table_every == 0:
-                    log_table(run, table_rows, native_audio)
+                    log_table(run, table_rows, native_audio, model_tag)
             if ann["parse_ok"]:
                 flag = " INCONSISTENT" if ann["inconsistent"] else ""
                 summary = (f"infant={ann['num_infants']} adult={ann['num_adults']} "
                            f"vis={ann['infant_visibility']}{flag}")
+            elif ann.get("degenerate"):
+                # Name the cause and the fix in the line you actually read.
+                summary = "DEGENERATE (NaN logits -- try --attn-impl eager)"
+            elif len(raw) >= args.max_new_tokens:
+                # At the cap with no closing brace: the JSON was cut off, which
+                # is a budget problem and nothing else.
+                summary = f"TRUNCATED at {args.max_new_tokens} tokens"
             else:
                 summary = "PARSE FAILED"
             print(f"[{k}/{n}] {vid} seg {i} [{hhmmss(start)}-{hhmmss(end)}] "
@@ -1523,7 +1612,7 @@ def main():
             summary = {f"{model_tag}/{k2}": v for k2, v in summary.items()}
         run.summary.update(summary)
         # Final flush: the last partial block since the periodic log.
-        log_table(run, table_rows, native_audio)
+        log_table(run, table_rows, native_audio, model_tag)
         run.finish()
         # Offline runs are inert until synced, and a run nobody syncs is a run
         # nobody sees. Print the exact command rather than leaving it to be

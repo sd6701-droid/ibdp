@@ -88,6 +88,12 @@ def main():
     ap.add_argument("--prompt-sha", default=None,
                     help="only compare records under this prompt hash "
                          "(default: the most common one present)")
+    ap.add_argument("--strict-prompt", action="store_true",
+                    help="drop every record whose prompt hash is not the "
+                         "dominant one. Off by default so Qwen3-Omni, whose "
+                         "prompt has an audio addendum and therefore a "
+                         "different hash, is still comparable on the shared "
+                         "fields.")
     ap.add_argument("--field", default=None,
                     help=f"single field to tabulate (default: {FIELDS[0]})")
     ap.add_argument("--max-rows", type=int, default=40,
@@ -121,17 +127,39 @@ def main():
                 counts[r.get("prompt_sha")] += 1
         sha = max(counts, key=counts.get)
 
-    by_model, _, dropped = load(args.outdir, args.video, sha)
+    # Qwen3-Omni's prompt carries an audio addendum, so its prompt_sha differs
+    # from every video-only model's BY DESIGN. Filtering to the dominant hash
+    # therefore drops Omni entirely -- and since 28_run_all_models.sh passes
+    # every model it ran via --models, the old behaviour was to abort the whole
+    # comparison over it. The audio-vs-video question is the reason Omni is in
+    # the list at all, so mixed prompts are allowed by default and the shared
+    # fields are compared; --strict-prompt restores hash-exact filtering.
+    by_model, _, dropped = load(args.outdir, args.video,
+                                sha if args.strict_prompt else None)
     if dropped:
         print(f"NOTE: ignored {dropped} record(s) under a different prompt "
               f"hash (comparing only {sha})\n", file=sys.stderr)
+
+    # Which prompt each model actually answered. Printed below, because a
+    # comparison across two prompts is only honest if it says so.
+    model_sha = {m: sorted({r.get("prompt_sha") for r in recs.values()})
+                 for m, recs in by_model.items()}
 
     models = sorted(by_model)
     if args.models:
         want = [m.strip() for m in args.models.split(",") if m.strip()]
         missing = [m for m in want if m not in by_model]
         if missing:
-            raise SystemExit(f"no records for: {', '.join(missing)}\n"
+            # Warn and continue. A model that produced nothing is a reason to
+            # exclude that model, not to throw away the other five.
+            print(f"WARNING: no records for {', '.join(missing)} -- excluded.",
+                  file=sys.stderr)
+            if args.strict_prompt:
+                print(f"         (--strict-prompt is on; they may simply be "
+                      f"under a different prompt hash)", file=sys.stderr)
+            want = [m for m in want if m in by_model]
+        if len(want) < 2:
+            raise SystemExit(f"only {len(want)} model(s) left after exclusions; "
                              f"present: {', '.join(models)}")
         models = want
     if len(models) < 2:
@@ -151,7 +179,14 @@ def main():
                   for _, r in sorted(by_model[m].items())
                   if r.get("video_name")), "")
     print(f"video    : {args.video}  {title[:60]}")
-    print(f"prompt   : {sha}")
+    shas_used = sorted({s for m in models for s in model_sha.get(m, [])})
+    if len(shas_used) > 1:
+        print(f"prompt   : MIXED -- " + ", ".join(
+            f"{m}={'/'.join(x or '?' for x in model_sha[m])}" for m in models))
+        print(f"           shared fields are comparable; the differing prompt "
+              f"is an addendum, not a different question")
+    else:
+        print(f"prompt   : {sha}")
     print(f"segments : {len(segs)}")
     print(f"models   : {len(models)}\n")
 
