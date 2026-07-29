@@ -180,11 +180,25 @@ for k in $TARGETS; do
 
   # --local-dir puts real files in the destination rather than cache symlinks,
   # so $MODELS is self-contained and survives an HF_HOME cleanup.
-  if $HF_BIN download "$repo" --local-dir "$dest" 2>&1 | tee -a "$LOG_DIR/$k.log"; then
+  $HF_BIN download "$repo" --local-dir "$dest" 2>&1 | tee -a "$LOG_DIR/$k.log"
+  # PIPESTATUS[0], not $?: $? is tee's status, which is 0 even when hf died.
+  rc="${PIPESTATUS[0]}"
+
+  if [[ "$rc" -eq 0 ]]; then
     touch "$dest/.complete"
     echo "    done: $(du -sh "$dest" | cut -f1)"
+  elif [[ "$rc" -ge 128 ]]; then
+    # 128+N means killed by signal N. Do NOT print the "gated repo?" advice
+    # here: nothing about the repo is wrong, the process was shot from outside.
+    # On a login node that is the resource-limit reaper, and it will keep
+    # happening -- the fix is a batch job, not a retry.
+    echo "    KILLED by signal $(( rc - 128 )) after $(du -sh "$dest" 2>/dev/null | cut -f1) downloaded." >&2
+    echo "    Nothing is lost: finished shards are kept and the next run resumes." >&2
+    echo "    On a LOGIN NODE this is usually the cgroup limit reaper -- parallel" >&2
+    echo "    shard downloads look like a runaway process. Rerun as a batch job:" >&2
+    echo "      sbatch scripts/13_fetch_models.sbatch --only $k" >&2
   else
-    echo "    FAILED -- see $LOG_DIR/$k.log" >&2
+    echo "    FAILED (exit $rc) -- see $LOG_DIR/$k.log" >&2
     echo "    gated repo? accept the licence on https://huggingface.co/$repo" >&2
     echo "    then: $HF_BIN auth login" >&2
   fi

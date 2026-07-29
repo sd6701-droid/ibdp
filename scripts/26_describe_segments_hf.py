@@ -188,6 +188,37 @@ from. If a fact appears in both, it belongs in only one of them.
 # identical no matter which checkpoint is loaded.
 # ---------------------------------------------------------------------------
 
+def verify_checkpoint(model_dir: Path):
+    """Every shard the index names must actually exist.
+
+    A DIRECTORY IS NOT A CHECKPOINT. An interrupted download leaves one that
+    passes every cheap test -- it exists, it is 54GB, `ls` looks right -- and
+    then dies deep inside from_pretrained with
+
+        FileNotFoundError: .../model-00009-of-00014.safetensors
+
+    after minutes of loading. On a multi-model run that is minutes wasted per
+    model behind it, too. The index file lists exactly which shards are
+    required, so checking is cheap and exact; do it before touching a GPU."""
+    idx = model_dir / "model.safetensors.index.json"
+    if idx.is_file():
+        try:
+            want = set(json.loads(idx.read_text()).get("weight_map", {}).values())
+        except (json.JSONDecodeError, OSError) as e:
+            raise SystemExit(f"{model_dir.name}: unreadable weight index ({e})")
+        missing = sorted(f for f in want if not (model_dir / f).is_file())
+        if missing:
+            raise SystemExit(
+                f"{model_dir.name} is INCOMPLETE: {len(missing)} of {len(want)} "
+                f"shards missing, starting with {missing[0]}\n"
+                f"  The download was interrupted. Finish it from a login node:\n"
+                f"    sbatch scripts/13_fetch_models.sbatch --only <key>\n"
+                f"  (a killed transfer keeps finished shards, so it resumes)")
+    elif not any(model_dir.glob("*.safetensors")) and not any(model_dir.glob("*.bin")):
+        raise SystemExit(f"{model_dir.name}: no weight files at all -- "
+                         f"the download never got past metadata.")
+
+
 def detect_backend(model_dir: Path) -> str:
     """Checkpoint -> backend name. Reads config.json's architectures first,
     because that is authoritative; the directory name is only a fallback for a
@@ -906,9 +937,23 @@ def init_wandb(args, model_tag, backend, prompt_sha, videos, n_segments):
 
     group = videos[0] if len(videos) == 1 else f"{len(videos)}-videos"
     suffix = "" if audio_mode == "none" else f"--{audio_mode}"
+
+    # SHARED-RUN MODE. When WANDB_RUN_ID is set -- 28_run_all_models.sh sets one
+    # per video -- every model in the sweep writes into ONE run instead of one
+    # run each. wandb reads the id straight from the environment, and
+    # WANDB_RESUME=allow lets each successive process attach to it.
+    #
+    # Two things MUST change in that mode or the shared run is unreadable:
+    #   1. metric keys get a per-model prefix (see the log call), otherwise six
+    #      models overwrite each other on identical key names;
+    #   2. the explicit step= is dropped. Steps must increase monotonically
+    #      within a run, and every process restarts its own k at 1 -- passing it
+    #      makes wandb discard everything after the first model.
+    shared = bool(os.environ.get("WANDB_RUN_ID"))
+
     run = wandb.init(
         project=args.wandb_project,
-        name=f"{model_tag}--{group}{suffix}",
+        name=f"all-models--{group}" if shared else f"{model_tag}--{group}{suffix}",
         group=group,
         job_type=f"{model_tag}[{audio_mode}]",
         config={
@@ -1200,6 +1245,7 @@ def main():
 
     if not args.model.is_dir():
         raise SystemExit(f"no checkpoint at {args.model}")
+    verify_checkpoint(args.model)
     model_tag = args.model_tag or args.model.name
     backend = args.backend or detect_backend(args.model)
 
@@ -1432,7 +1478,14 @@ def main():
                         "ann/num_humans_total": ann["num_humans_total"],
                         "ann/inconsistent": int(ann["inconsistent"]),
                     })
-                run.log(metrics, step=k)
+                # Shared run: namespace by model and let wandb assign the step.
+                # Six models write into one run, so identical key names would
+                # collide, and each process restarting k at 1 would make an
+                # explicit step= non-monotonic -- wandb drops those silently.
+                if os.environ.get("WANDB_RUN_ID"):
+                    run.log({f"{model_tag}/{key}": v for key, v in metrics.items()})
+                else:
+                    run.log(metrics, step=k)
                 table_rows.append(table_row(rec, ann, native_audio))
                 # Periodic, so a killed run still has most of its results in
                 # the UI. Every row is already safe in the JSONL; this is about
@@ -1455,7 +1508,7 @@ def main():
     print(f"wrote {args.out}")
 
     if run is not None:
-        run.summary.update({
+        summary = {
             "segments_attempted": n,
             "parsed": ok,
             "unparseable": bad,
@@ -1463,7 +1516,12 @@ def main():
             "total_minutes": total / 60,
             "sec_per_segment": total / max(ok + bad, 1),
             "output_file": args.out.name,
-        })
+        }
+        # Same collision problem as the metrics: in a shared run the last model
+        # to finish would otherwise be the only one whose summary survives.
+        if os.environ.get("WANDB_RUN_ID"):
+            summary = {f"{model_tag}/{k2}": v for k2, v in summary.items()}
+        run.summary.update(summary)
         # Final flush: the last partial block since the periodic log.
         log_table(run, table_rows, native_audio)
         run.finish()

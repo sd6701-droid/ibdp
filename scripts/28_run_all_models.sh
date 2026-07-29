@@ -101,6 +101,47 @@ for M in $MODELS; do
 done
 [[ $missing -eq 0 ]] || { echo "fix the above, or set MODELS= to what you have" >&2; exit 1; }
 
+# A DIRECTORY IS NOT A CHECKPOINT. A killed download leaves one that passes the
+# -d test above at 54GB of 64GB, then dies inside from_pretrained on a missing
+# shard -- as the 32B did, AFTER two other models had already run. The weight
+# index names every required shard, so verify all of them up front: this loop is
+# ordered smallest-first precisely so failures are cheap, and a checkpoint that
+# cannot load is the cheapest failure of all.
+python - "$ROOT/models" $MODELS <<'PY' || exit 1
+import json, sys
+from pathlib import Path
+
+root, names = Path(sys.argv[1]), sys.argv[2:]
+bad = []
+for name in names:
+    d = root / name
+    idx = d / "model.safetensors.index.json"
+    if idx.is_file():
+        try:
+            want = set(json.loads(idx.read_text()).get("weight_map", {}).values())
+        except Exception as e:
+            bad.append(f"{name}: unreadable weight index ({e})")
+            continue
+        miss = sorted(f for f in want if not (d / f).is_file())
+        if miss:
+            bad.append(f"{name}: {len(miss)} of {len(want)} shards missing "
+                       f"(first: {miss[0]})")
+    elif not any(d.glob("*.safetensors")) and not any(d.glob("*.bin")):
+        bad.append(f"{name}: no weight files at all")
+
+if bad:
+    print("INCOMPLETE CHECKPOINT(S) -- refusing to start:", file=sys.stderr)
+    for b in bad:
+        print(f"  {b}", file=sys.stderr)
+    print("\n  Finish the download from a LOGIN node (finished shards are kept):",
+          file=sys.stderr)
+    print("    sbatch scripts/13_fetch_models.sbatch --only <key>", file=sys.stderr)
+    print("  Or drop it for now:  MODELS=\"...\" scripts/28_run_all_models.sh ...",
+          file=sys.stderr)
+    sys.exit(1)
+print(f"checkpoints: {len(names)} verified, all shards present")
+PY
+
 # InternVL's vendored code hard-imports these. Checking here rather than 20
 # minutes into a weight load -- and pip cannot fix it on a compute node anyway,
 # which is exactly why it is worth failing early and loudly.
@@ -147,6 +188,33 @@ fi
 export HF_HUB_OFFLINE=1                 # weights are local; fail fast, don't hang
 export FORCE_QWENVL_VIDEO_READER=torchcodec
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# ---------------------------------------------------------------------------
+# W&B: ONE run for the whole sweep, not one per model.
+#
+# Every model here is a separate python process, so by default each would call
+# wandb.init() and create its own run -- six runs plus a comparison, which is
+# what you have to correlate by hand in the UI. Exporting a DETERMINISTIC run id
+# makes all of them attach to the same run instead: scripts/26 sees WANDB_RUN_ID,
+# prefixes its metrics with the model name, and drops its explicit step counter.
+#
+# Deterministic on the VIDEO id, not a timestamp, so a rerun after a walltime
+# kill resumes the same run rather than starting a seventh. WANDB_RESUME=allow
+# is what permits attaching to an id that already exists.
+#
+# WANDB_SEPARATE_RUNS=1 restores one-run-per-model if you ever want to diff two
+# models' system metrics side by side without untangling prefixes.
+# ---------------------------------------------------------------------------
+if [[ "${WANDB_SEPARATE_RUNS:-0}" != "1" ]]; then
+  for a in "${EXTRA[@]:-}"; do
+    if [[ "$a" == "--wandb" ]]; then
+      export WANDB_RUN_ID="allmodels-${VIDEO}"
+      export WANDB_RESUME=allow
+      echo "wandb  : single shared run '$WANDB_RUN_ID' for all models"
+      break
+    fi
+  done
+fi
 
 echo
 echo "video  : $VIDEO"
