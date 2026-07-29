@@ -128,6 +128,15 @@ Sort EVERY visible person into exactly one bucket; omit nobody:
   "num_humans_total": int,
   "infant_visibility": "full_body" | "partial_body" | "not_visible",
   "visible_infant_parts": ["head","face","torso","arms","hands","legs","feet"],
+  "location": "indoor" | "outdoor" | "vehicle",
+  "surface": "floor" | "rug_or_mat" | "bed" | "sofa" | "crib" | "highchair" | "held_by_person" | "grass" | "other" | "not_visible",
+  "camera_distance": "close_up" | "medium" | "wide",
+  "lighting": "bright" | "normal" | "dim",
+  "infant_clothing": "fully_clothed" | "partially_clothed" | "diaper_only" | "unclothed" | "not_visible",
+  "objects": ["up to 5 short noun phrases"],
+  "background_complexity": "minimal" | "moderate" | "cluttered",
+  "camera_motion": "static" | "shaky" | "panning" | "moving",
+  "image_quality": "good" | "fair" | "poor",
   "description": "at most 2 sentences"
 }
 
@@ -135,12 +144,36 @@ Sort EVERY visible person into exactly one bucket; omit nobody:
 - num_humans_total = num_infants + num_children + num_adults.
 - full_body = whole infant head-to-feet seen at some point; partial_body = only
   part of them; not_visible = no infant, and then parts is [].
+- surface: what the infant is mainly on or in; "held_by_person" if carried.
+  surface and infant_clothing are "not_visible" when there is no infant.
+- camera_distance: close_up = one person fills the frame; wide = whole room or
+  scene visible.
+- camera_motion: static = fixed camera; shaky = handheld wobble; panning =
+  deliberate sweep; moving = camera travels through the scene.
+- objects: at most 5 objects the people interact with or that are near the
+  infant, short noun phrases ("toy car", "bottle"); [] if none.
+- background_complexity: minimal = bare walls/floor; cluttered = many items.
+- image_quality: poor = blur, heavy compression, or too dark to judge people.
 - description: max 2 sentences, concrete and specific -- who, where, what they
   physically do, what they touch. Name the infant's posture. Only what is
   visible; no mood, no padding, no repetition."""
 
 VALID_VISIBILITY = {"full_body", "partial_body", "not_visible"}
 VALID_PARTS = {"head", "face", "torso", "arms", "hands", "legs", "feet"}
+
+# Scene / recording-condition vocabularies. CLOSED for the same reason the
+# audio events are: left open, "living room" / "lounge" / "indoors" never
+# aggregate. Unknown values are nulled, not kept.
+VALID_LOCATION = {"indoor", "outdoor", "vehicle"}
+VALID_SURFACE = {"floor", "rug_or_mat", "bed", "sofa", "crib", "highchair",
+                 "held_by_person", "grass", "other", "not_visible"}
+VALID_DISTANCE = {"close_up", "medium", "wide"}
+VALID_LIGHTING = {"bright", "normal", "dim"}
+VALID_CLOTHING = {"fully_clothed", "partially_clothed", "diaper_only",
+                  "unclothed", "not_visible"}
+VALID_BG_COMPLEXITY = {"minimal", "moderate", "cluttered"}
+VALID_CAMERA_MOTION = {"static", "shaky", "panning", "moving"}
+VALID_IMAGE_QUALITY = {"good", "fair", "poor"}
 
 # ---------------------------------------------------------------------------
 # Audio addendum -- ONLY for a model that actually hears the clip (qwen-omni).
@@ -951,11 +984,13 @@ class CachedTranscriber:
 def init_wandb(args, model_tag, backend, prompt_sha, videos, n_segments):
     """Start a W&B run, or return None when --wandb was not passed.
 
-    OFFLINE BY DEFAULT, and that default is the whole point: compute nodes here
-    have no outbound internet, and wandb.init() in online mode does not fail
-    fast on that -- it blocks, retries, and then drops your metrics while the
-    job appears to run normally. Offline writes to disk; you sync from a login
-    node afterwards (the command is printed at the end of the run).
+    ONLINE BY DEFAULT: runs stream to wandb.ai as they go, no manual sync step.
+    CAVEAT for nodes with no outbound internet: wandb.init() in online mode
+    does not fail fast there -- it blocks, retries, and then drops your metrics
+    while the job appears to run normally. If runs stall at init or show up
+    empty, pass --wandb-mode offline (or WANDB_MODE=offline): that writes to
+    disk and you sync from a login node afterwards (the command is printed at
+    the end of the run).
 
     Runs are GROUPED BY VIDEO and named by model, so the three models over one
     video land in one comparable group in the W&B UI instead of three unrelated
@@ -989,6 +1024,12 @@ def init_wandb(args, model_tag, backend, prompt_sha, videos, n_segments):
     group = videos[0] if len(videos) == 1 else f"{len(videos)}-videos"
     suffix = "" if audio_mode == "none" else f"--{audio_mode}"
 
+    # Unique-per-invocation tag minted by 28_run_all_models.sh. In the name so
+    # two sweeps over the same video are distinct runs at a glance, never one
+    # run resumed over another.
+    tag = os.environ.get("RUN_TAG")
+    suffix += f"--{tag}" if tag else ""
+
     # SHARED-RUN MODE. When WANDB_RUN_ID is set -- 28_run_all_models.sh sets one
     # per video -- every model in the sweep writes into ONE run instead of one
     # run each. wandb reads the id straight from the environment, and
@@ -1004,7 +1045,7 @@ def init_wandb(args, model_tag, backend, prompt_sha, videos, n_segments):
 
     run = wandb.init(
         project=args.wandb_project,
-        name=f"all-models--{group}" if shared else f"{model_tag}--{group}{suffix}",
+        name=f"all-models--{group}{suffix}" if shared else f"{model_tag}--{group}{suffix}",
         group=group,
         job_type=f"{model_tag}[{audio_mode}]",
         config={
@@ -1048,6 +1089,9 @@ def table_columns(audio: bool) -> list:
     cols = ["model", "segment", "timestamp", "url_at", "parse_ok",
             "num_infants", "num_children", "num_adults", "num_humans_total",
             "infant_visibility", "visible_parts", "inconsistent",
+            "location", "surface", "camera_distance", "lighting",
+            "infant_clothing", "objects", "background_complexity",
+            "camera_motion", "image_quality",
             "description"]
     if audio:
         cols += ["audio_events", "infant_vocalising", "speech_present",
@@ -1070,6 +1114,12 @@ def table_row(rec: dict, ann: dict, audio: bool) -> list:
            ann.get("infant_visibility"),
            ", ".join(ann.get("visible_infant_parts") or []),
            bool(ann.get("inconsistent")),
+           ann.get("location"), ann.get("surface"),
+           ann.get("camera_distance"), ann.get("lighting"),
+           ann.get("infant_clothing"),
+           ", ".join(ann.get("objects") or []),
+           ann.get("background_complexity"), ann.get("camera_motion"),
+           ann.get("image_quality"),
            # Unparseable segments keep their raw text -- that is the only place
            # you can see WHY they failed, and truncation is invisible in a
            # parse_ok=false flag alone.
@@ -1238,6 +1288,18 @@ def parse_annotation(raw: str, audio: bool = False) -> dict:
         parts = []
     parts = [p for p in (str(x).strip().lower() for x in parts) if p in VALID_PARTS]
 
+    # Closed-vocabulary scene fields: an off-vocabulary answer becomes None,
+    # same policy as infant_visibility -- a null is honest, a kept synonym
+    # poisons every aggregate.
+    def as_choice(key, valid):
+        v = str(d.get(key, "")).strip().lower()
+        return v if v in valid else None
+
+    objects = d.get("objects") or []
+    if not isinstance(objects, list):
+        objects = []
+    objects = [s for s in (str(x).strip() for x in objects) if s][:5]
+
     ann = {
         "has_infant": as_bool(d.get("has_infant")),
         "num_infants": as_int(d.get("num_infants")),
@@ -1247,6 +1309,16 @@ def parse_annotation(raw: str, audio: bool = False) -> dict:
         "num_humans_total": as_int(d.get("num_humans_total")),
         "infant_visibility": vis,
         "visible_infant_parts": parts,
+        "location": as_choice("location", VALID_LOCATION),
+        "surface": as_choice("surface", VALID_SURFACE),
+        "camera_distance": as_choice("camera_distance", VALID_DISTANCE),
+        "lighting": as_choice("lighting", VALID_LIGHTING),
+        "infant_clothing": as_choice("infant_clothing", VALID_CLOTHING),
+        "objects": objects,
+        "background_complexity": as_choice("background_complexity",
+                                           VALID_BG_COMPLEXITY),
+        "camera_motion": as_choice("camera_motion", VALID_CAMERA_MOTION),
+        "image_quality": as_choice("image_quality", VALID_IMAGE_QUALITY),
         "description": str(d.get("description", "")).strip(),
     }
 
@@ -1360,10 +1432,11 @@ def main():
     ap.add_argument("--wandb-table-every", type=int, default=10,
                     help="re-log the results table every N segments, so a "
                          "killed run still has its results in the UI.")
-    ap.add_argument("--wandb-mode", default="offline",
+    ap.add_argument("--wandb-mode", default="online",
                     choices=["offline", "online", "disabled"],
-                    help="offline is the default: compute nodes have no "
-                         "internet and online mode hangs there. Sync afterwards.")
+                    help="online is the default: runs stream to wandb.ai live. "
+                         "On a node with no outbound internet use offline "
+                         "(writes to disk; sync from a login node afterwards).")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():

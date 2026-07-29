@@ -40,6 +40,7 @@ qwen25-vl-72b|Qwen/Qwen2.5-VL-72B-Instruct|Qwen2.5-VL-72B-Instruct|145|4|qwen_vl
 internvl3-78b|OpenGVLab/InternVL3-78B|InternVL3-78B|156|4|needs trust_remote_code + new video path
 internvl3-38b|OpenGVLab/InternVL3-38B|InternVL3-38B|76|2|needs trust_remote_code + new video path
 whisper-large-v3|openai/whisper-large-v3|whisper-large-v3|3|1|audio only; scripts/31
+transnetv2|Sn4kehead/TransNetV2|TransNetV2|1|0|30MB shot-boundary CNN; scripts/32. Hub mirror of the official soCzech conversion (identical file in ByteDance/shot2story). Weights only -- the architecture is vendored at scripts/transnetv2_pytorch.py and the two MUST stay paired.
 qwen3-omni-30b|Qwen/Qwen3-Omni-30B-A3B-Instruct|Qwen3-Omni-30B-A3B-Instruct|71|2|NATIVE AUDIO+VIDEO; needs qwen-omni-utils
 "
 

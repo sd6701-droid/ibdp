@@ -42,7 +42,14 @@ LEGACY_MODEL_TAG = "Qwen3-VL-30B-A3B-Instruct"
 # Compared by default. Ordered: the counts first, since those are what the
 # downstream aggregation actually uses.
 FIELDS = ["num_infants", "num_adults", "num_children", "num_humans_total",
-          "has_infant", "infant_visibility"]
+          "has_infant", "infant_visibility",
+          # Scene fields, closed-vocabulary strings compared by equality just
+          # like infant_visibility. "objects" is deliberately absent: a free
+          # list where "toy car" vs "toy" counts as total disagreement says
+          # nothing useful about agreement.
+          "location", "surface", "camera_distance", "lighting",
+          "infant_clothing", "background_complexity", "camera_motion",
+          "image_quality"]
 
 
 def load(outdir: Path, video: str, want_sha: str | None):
@@ -106,7 +113,7 @@ def main():
     # Must match scripts/26's default, or the comparison lands in a different
     # W&B project than the runs it compares and looks like it never logged.
     ap.add_argument("--wandb-project", default="ibdp")
-    ap.add_argument("--wandb-mode", default="offline",
+    ap.add_argument("--wandb-mode", default="online",
                     choices=["offline", "online", "disabled"])
     ap.add_argument("--wandb-dir", type=Path, default=None,
                     help="where offline runs are written (default: --outdir)")
@@ -302,9 +309,11 @@ def log_to_wandb(args, sha, models, segs, rows, health, agree_rows, fields,
     os.environ.setdefault("WANDB_MODE", args.wandb_mode)
     os.environ.setdefault("WANDB_DIR", str(args.wandb_dir or args.outdir))
 
+    tag = os.environ.get("RUN_TAG")
+    default_name = f"compare--{args.video}" + (f"--{tag}" if tag else "")
     run = wandb.init(
         project=args.wandb_project,
-        name=os.environ.get("WANDB_NAME", f"compare--{args.video}"),
+        name=os.environ.get("WANDB_NAME", default_name),
         group=args.video,
         job_type="compare",
         config={"video": args.video, "prompt_sha": sha, "models": models,

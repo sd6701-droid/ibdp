@@ -94,6 +94,15 @@ if [[ "$WANDB" == "1" ]]; then
   export WANDB_MODE="${WANDB_MODE:-online}"
 fi
 
+# --- Fresh W&B runs, always --------------------------------------------------
+# Every invocation mints a unique tag, appended to every W&B run name
+# (<model>--<video>--<tag>, compare--<video>--<tag>), and any resume state
+# inherited from the shell is dropped -- a sweep NEVER attaches to or resumes a
+# previous W&B run. RUN_TAG=... overrides the tag if you want to name a sweep.
+RUN_TAG="${RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
+export RUN_TAG
+unset WANDB_RUN_ID WANDB_RESUME
+
 # --- W&B: tables only -------------------------------------------------------
 # WANDB_TABLES_ONLY=1 gives you ONE W&B run containing ONLY tables -- the
 # combined all_models table (model as the first column, one row per model x
@@ -249,17 +258,16 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # end. That is 7 runs for a 6-model sweep, grouped by video id in the UI.
 #
 # WANDB_SEPARATE_RUNS=0 collapses them into one shared run instead: exporting a
-# DETERMINISTIC run id makes every python process attach to the same run --
-# scripts/26 sees WANDB_RUN_ID, prefixes its metrics with the model name, and
-# drops its explicit step counter. Deterministic on the VIDEO id, not a
-# timestamp, so a rerun after a walltime kill resumes the same run rather than
-# starting another. WANDB_RESUME=allow is what permits attaching to an id that
-# already exists.
+# shared run id makes every python process attach to the same run -- scripts/26
+# sees WANDB_RUN_ID, prefixes its metrics with the model name, and drops its
+# explicit step counter. The id carries RUN_TAG, so even the shared run is
+# unique per invocation and never resumes a previous sweep's; WANDB_RESUME=allow
+# only lets the six processes of THIS sweep attach to it one after another.
 # ---------------------------------------------------------------------------
 if [[ "${WANDB_SEPARATE_RUNS:-1}" != "1" ]]; then
   for a in ${EXTRA[@]+"${EXTRA[@]}"}; do
     if [[ "$a" == "--wandb" ]]; then
-      export WANDB_RUN_ID="allmodels-${VIDEO}"
+      export WANDB_RUN_ID="allmodels-${VIDEO}-${RUN_TAG}"
       export WANDB_RESUME=allow
       echo "wandb  : single shared run '$WANDB_RUN_ID' for all models"
       break
@@ -279,6 +287,7 @@ else
 fi
 echo "outdir : $OUTDIR"
 echo "extra  : ${EXTRA[*]:-(none)}"
+echo "wandb  : tag $RUN_TAG -- fresh runs, one per model + compare"
 echo
 
 # ---------------------------------------------------------------------------
