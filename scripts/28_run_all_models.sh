@@ -60,24 +60,39 @@ MODELS="${MODELS:-Qwen3-VL-30B-A3B-Instruct Qwen3-Omni-30B-A3B-Instruct Qwen3-VL
 AUDIO="${AUDIO:-0}"
 
 # --- Shakedown window ------------------------------------------------------
-# Annotate only the first MAX_SECONDS of the video. 50s at the default 10s
-# window is 5 segments per model -- about 2 minutes of inference each, against
-# ~8 minutes for a full 22-segment pass, so a six-model sweep is ~15 minutes
-# instead of an hour.
+# Annotate only the first MAX_SECONDS of the video. 20s at the default 10s
+# window is 2 segments per model -- under a minute of inference each, against
+# ~8 minutes for a full 22-segment pass.
 #
-# DEFAULTED TO 50 WHILE WE ARE STILL TESTING. This is a trap if you forget it:
-# a "full run" that quietly stops at 50 seconds looks like a complete corpus.
+# DEFAULTED TO 20 WHILE WE ARE STILL TESTING. This is a trap if you forget it:
+# a "full run" that quietly stops at 20 seconds looks like a complete corpus.
 # Hence the banner below, and MAX_SECONDS=0 to turn it off:
 #
 #   MAX_SECONDS=0 scripts/28_run_all_models.sh VIDEO_ID
 #
 # Segment indices match a full run, so the capped records are the genuine first
-# five and a later MAX_SECONDS=0 run resumes over the top of them.
-MAX_SECONDS="${MAX_SECONDS:-50}"
+# two and a later MAX_SECONDS=0 run resumes over the top of them.
+MAX_SECONDS="${MAX_SECONDS:-20}"
 
 VIDEO="${1:-}"
 shift 2>/dev/null || true
 EXTRA=("$@")              # everything else is forwarded to the python script
+
+# --- W&B: on by default ------------------------------------------------------
+# --wandb is appended automatically and WANDB_MODE defaults to online, so the
+# command line stays short: one W&B run per model (see WANDB_SEPARATE_RUNS
+# below) plus one compare run, each carrying its results table. WANDB=0 turns
+# all logging off; WANDB_TABLES_ONLY=1 below still strips --wandb back out of
+# the model runs and keeps only the compare run.
+WANDB="${WANDB:-1}"
+if [[ "$WANDB" == "1" ]]; then
+  _seen_wandb=0
+  for a in ${EXTRA[@]+"${EXTRA[@]}"}; do
+    [[ "$a" == "--wandb" ]] && _seen_wandb=1
+  done
+  [[ "$_seen_wandb" == "1" ]] || EXTRA+=(--wandb)
+  export WANDB_MODE="${WANDB_MODE:-online}"
+fi
 
 # --- W&B: tables only -------------------------------------------------------
 # WANDB_TABLES_ONLY=1 gives you ONE W&B run containing ONLY tables -- the
@@ -229,22 +244,19 @@ export FORCE_QWENVL_VIDEO_READER=torchcodec
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # ---------------------------------------------------------------------------
-# W&B: ONE run for the whole sweep, not one per model.
+# W&B: ONE run PER MODEL (the default), named after the model, each carrying
+# that model's results table and system metrics -- plus the compare run at the
+# end. That is 7 runs for a 6-model sweep, grouped by video id in the UI.
 #
-# Every model here is a separate python process, so by default each would call
-# wandb.init() and create its own run -- six runs plus a comparison, which is
-# what you have to correlate by hand in the UI. Exporting a DETERMINISTIC run id
-# makes all of them attach to the same run instead: scripts/26 sees WANDB_RUN_ID,
-# prefixes its metrics with the model name, and drops its explicit step counter.
-#
-# Deterministic on the VIDEO id, not a timestamp, so a rerun after a walltime
-# kill resumes the same run rather than starting a seventh. WANDB_RESUME=allow
-# is what permits attaching to an id that already exists.
-#
-# WANDB_SEPARATE_RUNS=1 restores one-run-per-model if you ever want to diff two
-# models' system metrics side by side without untangling prefixes.
+# WANDB_SEPARATE_RUNS=0 collapses them into one shared run instead: exporting a
+# DETERMINISTIC run id makes every python process attach to the same run --
+# scripts/26 sees WANDB_RUN_ID, prefixes its metrics with the model name, and
+# drops its explicit step counter. Deterministic on the VIDEO id, not a
+# timestamp, so a rerun after a walltime kill resumes the same run rather than
+# starting another. WANDB_RESUME=allow is what permits attaching to an id that
+# already exists.
 # ---------------------------------------------------------------------------
-if [[ "${WANDB_SEPARATE_RUNS:-0}" != "1" ]]; then
+if [[ "${WANDB_SEPARATE_RUNS:-1}" != "1" ]]; then
   for a in ${EXTRA[@]+"${EXTRA[@]}"}; do
     if [[ "$a" == "--wandb" ]]; then
       export WANDB_RUN_ID="allmodels-${VIDEO}"
@@ -307,9 +319,9 @@ for M in $MODELS; do
       --model "$ROOT/models/$M" \
       --only "$VIDEO" \
       --outdir "$OUTDIR" \
-      "${RESUME_ARG[@]}" \
-      "${LIMIT_ARG[@]}" \
-      "${AUDIO_ARGS[@]}" \
+      ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
+      ${LIMIT_ARG[@]+"${LIMIT_ARG[@]}"} \
+      ${AUDIO_ARGS[@]+"${AUDIO_ARGS[@]}"} \
       ${EXTRA[@]+"${EXTRA[@]}"} 2>&1 | tee "$log"
 
   # PIPESTATUS[0], not $?: $? is tee's status, which is 0 even when python died.
@@ -356,7 +368,7 @@ done
 
 python scripts/27_compare_models.py \
     --outdir "$OUTDIR" --video "$VIDEO" --models "$joined" --csv "$csv" \
-    "${CMP_WANDB[@]}" \
+    ${CMP_WANDB[@]+"${CMP_WANDB[@]}"} \
     2>&1 | tee "$txt"
 
 echo
