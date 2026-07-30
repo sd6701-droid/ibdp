@@ -7,6 +7,17 @@ run through MMPose.
     python scripts/30_infant_pose.py --id -EiqT5BpcpI
     python scripts/30_infant_pose.py --url "https://youtu.be/-EiqT5BpcpI" --seconds 10
 
+Also runs on ANY local video file -- e.g. the COPE clinical samples, which live
+outside the YouTube dataset entirely:
+
+    python scripts/30_infant_pose.py \
+        --video /gpfs/scratch/sd6701/COPE_samples/Arm_Restraint_6mo__534_6_Arm_Restraint.mov \
+        --seconds 30
+
+    --seconds 0 means the WHOLE video. Output dir is named after the file stem.
+    COPE is clinical data: outputs stay on gpfs (the PHI guard in .gitignore
+    already refuses outputs/), and nothing here uploads frames anywhere.
+
 Outputs, under outputs/poses/<video_id>/:
     vis/     frames (and a video) with the skeleton drawn on
     pred/    per-frame JSON: 17 COCO keypoints [x, y, score] per detected person
@@ -61,11 +72,16 @@ def resolve_id(s: str) -> str:
 
 
 def cut_clip(src: Path, seconds: float, dst: Path):
-    """First `seconds` of src -> dst. Re-encode (not -c copy) so the cut is
-    frame-accurate rather than snapping to the nearest keyframe."""
+    """First `seconds` of src -> dst (0 = the whole video). Re-encode (not
+    -c copy) so the cut is frame-accurate rather than snapping to the nearest
+    keyframe -- and, for non-mp4 sources like the COPE .mov files, so the
+    inferencer always reads one uniform container instead of whatever the
+    camera wrote."""
     dst.parent.mkdir(parents=True, exist_ok=True)
-    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
-           "-t", str(seconds), "-an", str(dst)]
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src)]
+    if seconds:
+        cmd += ["-t", str(seconds)]
+    cmd += ["-an", str(dst)]
     subprocess.run(cmd, check=True)
 
 
@@ -74,7 +90,11 @@ def main():
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--id", help="youtube video id (11 chars)")
     g.add_argument("--url", help="youtube watch or youtu.be url")
-    ap.add_argument("--seconds", type=float, default=10.0)
+    g.add_argument("--video", type=Path,
+                   help="path to any local video file (e.g. a COPE sample); "
+                        "bypasses the YouTube dataset entirely")
+    ap.add_argument("--seconds", type=float, default=10.0,
+                    help="pose only the first N seconds; 0 = whole video")
     ap.add_argument("--config", type=Path, default=Path(DEFAULT_CONFIG))
     ap.add_argument("--weights", type=Path, default=WEIGHTS)
     ap.add_argument("--outdir", type=Path, default=ROOT / "outputs/poses")
@@ -83,11 +103,19 @@ def main():
                     help="hide keypoints below this confidence")
     args = ap.parse_args()
 
-    vid = resolve_id(args.id or args.url)
-    mp4 = VIDEOS / f"{vid}.mp4"
-    if not mp4.exists():
-        raise SystemExit(f"no video for id {vid} at {mp4}\n"
-                         f"(is it in the dataset? ls {VIDEOS})")
+    if args.video is not None:
+        src = args.video
+        if not src.is_file():
+            raise SystemExit(f"no such video file: {src}")
+        # Output dir named by the file stem, sanitised: COPE names carry
+        # spaces-adjacent characters that make shell-quoting downstream a chore.
+        vid = re.sub(r"[^0-9A-Za-z._-]+", "_", src.stem)
+    else:
+        vid = resolve_id(args.id or args.url)
+        src = VIDEOS / f"{vid}.mp4"
+        if not src.exists():
+            raise SystemExit(f"no video for id {vid} at {src}\n"
+                             f"(is it in the dataset? ls {VIDEOS})")
     if not args.weights.exists():
         raise SystemExit(f"missing weights: {args.weights}\n"
                          "download split1 from Zenodo 14833182 on a login node.")
@@ -112,9 +140,11 @@ def main():
     (out / "vis").mkdir(parents=True, exist_ok=True)
     (out / "pred").mkdir(parents=True, exist_ok=True)
 
-    clip = out / f"{vid}_first{int(args.seconds)}s.mp4"
-    print(f"cutting first {args.seconds:.0f}s -> {clip}", flush=True)
-    cut_clip(mp4, args.seconds, clip)
+    tag = f"first{int(args.seconds)}s" if args.seconds else "full"
+    clip = out / f"{vid}_{tag}.mp4"
+    print(f"cutting {'first %.0fs' % args.seconds if args.seconds else 'whole video'}"
+          f" -> {clip}", flush=True)
+    cut_clip(src, args.seconds, clip)
 
     print(f"loading ViTPose (weights={args.weights.name}) on {device}...", flush=True)
     inferencer = MMPoseInferencer(
