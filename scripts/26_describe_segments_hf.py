@@ -1546,13 +1546,14 @@ def main():
                          "resumes over it cleanly.")
     ap.add_argument("--min-tail", type=float, default=2.0)
     ap.add_argument("--fps", type=float, default=2.0)
-    # 256: the structured fields are tiny and `description` is capped at two
-    # sentences, so this is ample. It must stay comfortably ABOVE the real
-    # output length -- a description truncated mid-sentence yields JSON with no
-    # closing brace, parse_ok goes false, and the whole segment is lost, counts
-    # included. Generation dominates per-segment cost, so this is also the
-    # cheapest lever on total runtime.
-    ap.add_argument("--max-new-tokens", type=int, default=256)
+    # 512, raised from 256 when the prompt grew its nine scene fields. The cap
+    # must stay comfortably ABOVE the real output length -- a truncated answer
+    # has no closing brace, parse_ok goes false, and the whole segment is lost,
+    # counts included. At 256 that was ~25% of segments: the models
+    # pretty-print inside a ```json fence, and the scene keys pushed real
+    # answers right past the cap (observed cut mid-key at "infant_clothing").
+    # A bigger cap costs nothing when generation stops at EOS anyway.
+    ap.add_argument("--max-new-tokens", type=int, default=512)
     # Qwen only: whole-clip vision-token budget, ~= total_pixels / (32*32).
     ap.add_argument("--total-pixels-factor", type=int, default=20480)
     # InternVL only. 32 frames x 448px is already ~8k vision tokens; the cap
@@ -1564,6 +1565,12 @@ def main():
                     help="Qwen3-Omni attention kernel. Use 'eager' if segments "
                          "come back as '!!!!!!' -- that is NaN logits, and "
                          "eager is numerically steadier (and slower).")
+    # Debugging aid: dump the model's VERBATIM text for every segment, before
+    # any parsing -- the only way to see the difference between "model wrote
+    # bad JSON", "model wrote nothing", and "parser dropped good JSON" without
+    # fishing raw out of the JSONL. Loud on purpose; not for corpus runs.
+    ap.add_argument("--log-raw", action="store_true",
+                    help="print each segment's raw model output to the log")
     ap.add_argument("--wandb", action="store_true",
                     help="log GPU usage + per-segment metrics to Weights & Biases")
     ap.add_argument("--wandb-project", default="ibdp")
@@ -1598,27 +1605,9 @@ def main():
     # resume into each other either.
     native_audio = backend == "qwen-omni"
 
-    # The audio schema adds five keys on top of the twelve video ones, and the
-    # 256 default was sized for the video-only answer.
-    #
-    # 512, NOT 384, and the number comes from measurement rather than taste.
-    # Two truncated segments of 8yDn1uFbs4s stopped at 936 and 909 characters --
-    # ~250 tokens, i.e. exactly the 256 cap -- and had reached only
-    # "audio_description" and "infant_vocalising" respectively, with up to four
-    # fields still to emit. 384 would have clipped the longer of those too.
-    #
-    # The model pretty-prints its JSON (newlines, 2-space indent), which burns
-    # perhaps a third of the budget on whitespace. Telling it to emit compact
-    # JSON would be the cheaper fix, but that changes PROMPT and therefore
-    # prompt_sha, invalidating every annotation already collected. A bigger cap
-    # costs nothing when generation stops at EOS anyway.
-    #
-    # Only bumped when the default was left untouched, so an explicit
-    # --max-new-tokens still wins.
-    if native_audio and args.max_new_tokens == 256:
-        args.max_new_tokens = 512
-        print(f"note:     --max-new-tokens raised to {args.max_new_tokens} for "
-              f"the audio schema (5 extra fields)", flush=True)
+    # The 512 default covers the audio schema too (5 extra keys on top of the
+    # video ones) -- the old auto-bump for Omni existed only because the
+    # default was 256, sized before the scene fields grew every answer.
     prompt_sha = hashlib.sha256(
         (PROMPT
          + (TRANSCRIPT_TEMPLATE if args.transcribe else "")
@@ -1947,6 +1936,14 @@ def main():
             except Exception as e:
                 print(f"[{k}/{n}] FAIL {vid} seg {i}: {e}", flush=True)
                 continue
+
+            if args.log_raw:
+                # Verbatim, delimited, before parsing. An empty answer is a
+                # different bug than a malformed one -- say which it is.
+                body = raw if raw.strip() else "(EMPTY -- model emitted nothing)"
+                print(f"----- raw output [{model_tag}] {vid} "
+                      f"{w['split'] or 'seg'} {i} -----\n{body}\n"
+                      f"----- end raw ({len(raw)} chars) -----", flush=True)
 
             ann = parse_annotation(raw, audio=native_audio)
             # Recorded on the annotation itself, so a corpus can be filtered on
