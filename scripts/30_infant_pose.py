@@ -113,6 +113,12 @@ def main():
     ap.add_argument("--device", default=None, help="cuda:0 | cpu (auto if unset)")
     ap.add_argument("--kpt-thr", type=float, default=0.3,
                     help="hide keypoints below this confidence")
+    # Draw the DETECTOR's box as well as the skeleton. The box is always
+    # computed (top-down pose cannot run without it); this only controls
+    # whether the overlay shows it -- which is how the earlier per-segment
+    # overlays in pose_videos/ looked.
+    ap.add_argument("--draw-bbox", action="store_true",
+                    help="draw each person's detection box on the overlay")
     args = ap.parse_args()
 
     if args.video is not None:
@@ -184,6 +190,7 @@ def main():
         vis_out_dir=str(out / "vis"),
         pred_out_dir=str(out / "pred"),
         kpt_thr=args.kpt_thr,
+        draw_bbox=args.draw_bbox,
         return_vis=False,
     ):
         n += 1
