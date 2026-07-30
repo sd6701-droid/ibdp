@@ -823,7 +823,18 @@ class QwenOmniAnnotator:
         Identical samples, identical use_audio_in_video interleaving; only
         WHERE the decoding happens changes. An extraction failure raises,
         which the per-segment try/except turns into one FAIL line instead of
-        a dead run."""
+        a dead run.
+
+        TWO interceptions, not one, because installed qwen_omni_utils
+        versions differ in HOW they hand the file to librosa:
+          1. a plain path string          -> caught by safe_load below;
+          2. audioread.ffdec.FFmpegAudioFile(path) -- older releases wrap the
+             video FIRST. That constructor already spawns an in-process
+             decoder before librosa ever sees it, so wrapping librosa.load
+             alone is too late: the class itself is replaced with a shim that
+             only records the filename, and safe_load unwraps it. This was
+             found the hard way: a run with interception (1) alone still hit
+             __audioread_load and segfaulted before its first segment."""
         import librosa
         import numpy as np
         import soundfile
@@ -831,11 +842,42 @@ class QwenOmniAnnotator:
         orig_load = librosa.load
         tmpdir = self._tmp
 
+        try:
+            import audioread.ffdec as _ffdec
+
+            class _LazyAudioPath:
+                """Stands in for FFmpegAudioFile: keeps the filename, spawns
+                NOTHING. safe_load unwraps it to the ffmpeg-CLI route."""
+                def __init__(self, filename, *a, **k):
+                    self.filename = str(filename)
+
+                def close(self):
+                    pass
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+            _ffdec.FFmpegAudioFile = _LazyAudioPath
+        except ImportError:
+            pass    # no audioread installed -> nothing to neutralise
+
         def safe_load(path, *args, sr=22050, mono=True, offset=0.0,
                       duration=None, **kwargs):
+            # Unwrap an (already-shimmed or real) audioread object to its
+            # filename; close it so a REAL one cannot leak its decoder.
+            fname = getattr(path, "filename", None)
+            if fname is not None:
+                try:
+                    path.close()
+                except Exception:
+                    pass
+                path = fname
             p = str(path)
             # Real files only: librosa.load also accepts file-like objects,
-            # which ffmpeg cannot take -- those keep the original path.
+            # which ffmpeg cannot take -- those keep the original loader.
             if not os.path.isfile(p) or p.lower().endswith((".wav", ".flac")):
                 return orig_load(path, *args, sr=sr, mono=mono, offset=offset,
                                  duration=duration, **kwargs)

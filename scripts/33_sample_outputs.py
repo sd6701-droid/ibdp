@@ -102,6 +102,10 @@ def main():
                 names = ({t for t in toks if ":" not in t}
                          | {t.split(":", 1)[1] for t in toks
                             if t.split(":", 1)[0] == vid})
+                if not names:
+                    # Every token is scoped to some OTHER video: this video
+                    # simply is not part of the probe -- not a miss.
+                    continue
                 # All records at one (video, segment) share their split name,
                 # so checking any one of them is checking them all.
                 cands = [(s, d) for s, d in cands
