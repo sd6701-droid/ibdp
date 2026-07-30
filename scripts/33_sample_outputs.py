@@ -23,6 +23,7 @@ dump belongs in the source JSONL where its context is.
 """
 import argparse
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -42,9 +43,11 @@ def main():
                          "picking by coverage (splits are index*100, so "
                          "split_03 whole = 300)")
     ap.add_argument("--split", default=None,
-                    help="force this split NAME for every video (e.g. "
-                         "split_10). Coverage still breaks ties between a "
-                         "windowed split's parts.")
+                    help="force split NAME(s): a single name for every video "
+                         "(split_10), or a comma list of video-scoped tokens "
+                         "(8yDn1uFbs4s:split_03,gN3aRdFW45g:split_07) -- the "
+                         "same syntax scripts/26 --splits takes. Coverage "
+                         "still breaks ties between a windowed split's parts.")
     # W&B: one run per invocation carrying (a) a table with one row per
     # video x model -- the side-by-side view this script exists for -- and
     # (b) the JSON itself as an ARTIFACT. Artifacts version by name, so
@@ -93,10 +96,16 @@ def main():
         else:
             cands = [(k[1], d) for k, d in recs.items() if k[0] == vid]
             if args.split:
+                # Which split names apply to THIS video: bare tokens apply to
+                # every video, "vid:split" tokens only to their own.
+                toks = [t.strip() for t in args.split.split(",") if t.strip()]
+                names = ({t for t in toks if ":" not in t}
+                         | {t.split(":", 1)[1] for t in toks
+                            if t.split(":", 1)[0] == vid})
                 # All records at one (video, segment) share their split name,
                 # so checking any one of them is checking them all.
                 cands = [(s, d) for s, d in cands
-                         if next(iter(d.values())).get("split") == args.split]
+                         if next(iter(d.values())).get("split") in names]
             cands.sort(key=lambda x: (-len(x[1]), x[0]))
             if not cands:
                 what = f"split {args.split!r}" if args.split else "scene records"
@@ -129,7 +138,11 @@ def main():
 
     if args.wandb:
         import wandb
-        tag = args.split or f"{len(videos)}videos"
+        # Artifact/run names cannot carry ':' or ',', which the scoped token
+        # list does. Sanitised and capped, not rejected: the exact selection
+        # is in the run config either way.
+        tag = re.sub(r"[^0-9A-Za-z._-]+", "_",
+                     args.split or f"{len(videos)}videos")[:64]
         run = wandb.init(
             project=args.wandb_project,
             name=f"probe--{tag}",

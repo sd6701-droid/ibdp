@@ -433,11 +433,35 @@ echo "ran ${#OK_MODELS[@]} ok, ${#BAD_MODELS[@]} failed, in $(( (SECONDS - t_all
 # ---------------------------------------------------------------------------
 # 27 compares ONE video's records; an all-videos sweep skips it rather than
 # pretending. The per-video command is printed so it is a paste, not a hunt.
+#
+# BUT a sweep that carried --splits is a PROBE, and a probe's deliverable is
+# the bundle: one JSON with every model's answer for the chosen split(s), side
+# by side, logged to W&B (table + versioned artifact) like the model runs.
 if [[ "$VIDEO" == "all" ]]; then
-  echo
-  echo "no comparison for an all-videos sweep. Per video, when you want one:"
-  echo "  python scripts/27_compare_models.py --outdir $OUTDIR --video <VIDEO_ID> \\"
-  echo "      --segmentation scenes --csv $OUTDIR/compare_<VIDEO_ID>.csv"
+  SPLITS_VAL=""
+  _prev=""
+  for a in ${EXTRA[@]+"${EXTRA[@]}"}; do
+    [[ "$_prev" == "--splits" ]] && SPLITS_VAL="$a"
+    [[ "$a" == --splits=* ]] && SPLITS_VAL="${a#*=}"
+    _prev="$a"
+  done
+  if [[ -n "$SPLITS_VAL" && -n "$SCENES_DIR" ]]; then
+    VIDS=$(ls -d "$SCENES_DIR"/*/ 2>/dev/null | xargs -n1 basename | paste -sd,)
+    declare -a PROBE_WANDB=()
+    [[ "$WANDB" == "1" ]] && PROBE_WANDB=(--wandb)
+    echo
+    echo "=== probe bundle ==="
+    python scripts/33_sample_outputs.py \
+        --videos "$VIDS" \
+        --split "$SPLITS_VAL" \
+        --out "$OUTDIR/probe_${RUN_TAG}.json" \
+        ${PROBE_WANDB[@]+"${PROBE_WANDB[@]}"}
+  else
+    echo
+    echo "no comparison for an all-videos sweep. Per video, when you want one:"
+    echo "  python scripts/27_compare_models.py --outdir $OUTDIR --video <VIDEO_ID> \\"
+    echo "      --segmentation scenes --csv $OUTDIR/compare_<VIDEO_ID>.csv"
+  fi
   exit 0
 fi
 if [[ ${#OK_MODELS[@]} -lt 2 ]]; then
