@@ -1505,6 +1505,14 @@ def main():
                     help="annotate scene splits from this dir "
                          "(outputs/scenes) instead of fixed windows over "
                          "--videos. See scripts/32_split_scenes.py.")
+    # Scenes mode only: annotate just these splits instead of every split of
+    # the --only videos. Tokens are split names ("split_03"), optionally
+    # video-scoped ("8yDn1uFbs4s:split_03") since every video has a split_03.
+    # For a targeted "what does each model say about THIS clip" probe, not for
+    # corpus work.
+    ap.add_argument("--splits", default=None,
+                    help="comma-separated split filter, e.g. "
+                         "'8yDn1uFbs4s:split_03,gN3aRdFW45g:split_07'")
     ap.add_argument("--manifest", type=Path,
                     default=ROOT / "youtube_dataset/manifest.tsv")
     # Default: a NEW timestamped file per run, so a run never mutates an older
@@ -1656,6 +1664,11 @@ def main():
     # (and vice versa) wherever the indices happen to overlap.
     seg_mode = "scenes" if args.scenes else "fixed"
 
+    args.split_set = ({t.strip() for t in args.splits.split(",") if t.strip()}
+                      if args.splits else None)
+    if args.split_set and not args.scenes:
+        raise SystemExit("--splits only makes sense with --scenes")
+
     if args.scenes:
         if not args.scenes.is_dir():
             raise SystemExit(
@@ -1765,6 +1778,12 @@ def main():
                     i = int(sm["index"])
                 except (KeyError, TypeError, ValueError):
                     i = int(sd.name.rsplit("_", 1)[1])
+                # --splits filter: match by split name or index, bare or
+                # video-scoped. An unmatched split is simply not work.
+                if args.split_set and not ({sd.name, f"{vid}:{sd.name}",
+                                            str(i), f"{vid}:{i}"}
+                                           & args.split_set):
+                    continue
                 # encoded_duration is what ffprobe measured AFTER the cut's
                 # re-encode -- the ground truth about this file, where
                 # end-start is only the plan it was cut from.

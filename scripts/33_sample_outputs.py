@@ -41,6 +41,10 @@ def main():
                     help="force this segment_index for every video instead of "
                          "picking by coverage (splits are index*100, so "
                          "split_03 whole = 300)")
+    ap.add_argument("--split", default=None,
+                    help="force this split NAME for every video (e.g. "
+                         "split_10). Coverage still breaks ties between a "
+                         "windowed split's parts.")
     args = ap.parse_args()
 
     videos = [v.strip() for v in args.videos.split(",") if v.strip()]
@@ -79,10 +83,16 @@ def main():
                 print(f"{vid}: no records for segment {args.segment}")
                 continue
         else:
-            cands = sorted(((k[1], d) for k, d in recs.items() if k[0] == vid),
-                           key=lambda x: (-len(x[1]), x[0]))
+            cands = [(k[1], d) for k, d in recs.items() if k[0] == vid]
+            if args.split:
+                # All records at one (video, segment) share their split name,
+                # so checking any one of them is checking them all.
+                cands = [(s, d) for s, d in cands
+                         if next(iter(d.values())).get("split") == args.split]
+            cands.sort(key=lambda x: (-len(x[1]), x[0]))
             if not cands:
-                print(f"{vid}: NO scene records found")
+                what = f"split {args.split!r}" if args.split else "scene records"
+                print(f"{vid}: no {what} found")
                 continue
             seg, by_model = cands[0]
 
