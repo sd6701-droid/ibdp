@@ -98,6 +98,18 @@ def main():
     ap.add_argument("--config", type=Path, default=Path(DEFAULT_CONFIG))
     ap.add_argument("--weights", type=Path, default=WEIGHTS)
     ap.add_argument("--outdir", type=Path, default=ROOT / "outputs/poses")
+    # The person DETECTOR, explicitly. Left to itself, MMPoseInferencer
+    # resolves its default detector config relative to the pip-installed
+    # mmpose's .mim directory -- which does not exist when mmpose is imported
+    # from a source clone (our setup), and the failure is an opaque
+    # "Cannot find model ... in mmdet". The clone carries the same config at
+    # demo/mmdetection_cfg/, so point there and sidestep the packaging mess.
+    ap.add_argument("--det-config", type=Path, default=None,
+                    help="mmdet person-detector config .py (e.g. the clone's "
+                         "demo/mmdetection_cfg/rtmdet_m_640-8xb32_coco-person.py)")
+    ap.add_argument("--det-weights", type=Path, default=None,
+                    help="matching detector checkpoint .pth (local file; "
+                         "compute nodes cannot download)")
     ap.add_argument("--device", default=None, help="cuda:0 | cpu (auto if unset)")
     ap.add_argument("--kpt-thr", type=float, default=0.3,
                     help="hide keypoints below this confidence")
@@ -147,11 +159,23 @@ def main():
     cut_clip(src, args.seconds, clip)
 
     print(f"loading ViTPose (weights={args.weights.name}) on {device}...", flush=True)
-    inferencer = MMPoseInferencer(
+    kwargs = dict(
         pose2d=str(args.config),
         pose2d_weights=str(args.weights),
         device=device,
     )
+    if args.det_config is not None:
+        if not args.det_config.is_file():
+            raise SystemExit(f"missing detector config: {args.det_config}")
+        kwargs["det_model"] = str(args.det_config)
+        # det_cat_ids: with an explicit detector config the inferencer no
+        # longer knows which class is "person" -- in COCO that is category 0.
+        kwargs["det_cat_ids"] = [0]
+        if args.det_weights is not None:
+            if not args.det_weights.is_file():
+                raise SystemExit(f"missing detector weights: {args.det_weights}")
+            kwargs["det_weights"] = str(args.det_weights)
+    inferencer = MMPoseInferencer(**kwargs)
 
     print("running pose over the clip...", flush=True)
     n = 0
