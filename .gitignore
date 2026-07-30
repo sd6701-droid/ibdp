@@ -44,6 +44,12 @@ pose_videos/
 # Local scene-split test output (scripts/32) -- clips, wavs, thumbs, meta
 test_data_splits/
 
+# Probe/sample bundles from scripts/33 & 34, when copied to the repo root for
+# a look. Model outputs, not code; the canonical copies live in outputs/ on
+# gpfs (and in W&B once logged).
+probe_*_all_models.json
+sample_*_all_models.json
+
 # Explicit opt-in for synthetic / example assets only
 !examples/assets/**
 !docs/**/*.png

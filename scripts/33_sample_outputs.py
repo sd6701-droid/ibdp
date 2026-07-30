@@ -45,6 +45,14 @@ def main():
                     help="force this split NAME for every video (e.g. "
                          "split_10). Coverage still breaks ties between a "
                          "windowed split's parts.")
+    # W&B: one run per invocation carrying (a) a table with one row per
+    # video x model -- the side-by-side view this script exists for -- and
+    # (b) the JSON itself as an ARTIFACT. Artifacts version by name, so
+    # re-running after new model results gives probe-split_10 v0, v1, ... with
+    # diffable history instead of an overwritten file.
+    ap.add_argument("--wandb", action="store_true",
+                    help="log the bundle to W&B (table + versioned artifact)")
+    ap.add_argument("--wandb-project", default="ibdp")
     args = ap.parse_args()
 
     videos = [v.strip() for v in args.videos.split(",") if v.strip()]
@@ -118,6 +126,53 @@ def main():
                        f"sample_{len(videos)}videos_all_models.json")
     dst.write_text(json.dumps(out, indent=2))
     print(f"\nwrote {dst}")
+
+    if args.wandb:
+        import wandb
+        tag = args.split or f"{len(videos)}videos"
+        run = wandb.init(
+            project=args.wandb_project,
+            name=f"probe--{tag}",
+            job_type="probe",
+            group=tag,
+            config={"videos": videos, "split": args.split,
+                    "segment": args.segment, "source": str(dst)},
+        )
+        cols = ["video_id", "split", "segment", "url_at", "model",
+                "num_infants", "num_children", "num_adults",
+                "infant_visibility", "location", "surface", "camera_distance",
+                "lighting", "infant_clothing", "objects",
+                "background_complexity", "camera_motion", "image_quality",
+                "inconsistent", "description",
+                "audio_events", "audio_description"]
+        rows = []
+        for vid, entry in out.items():
+            for model, r in sorted(entry["models"].items()):
+                rows.append([
+                    vid, entry["split"], entry["segment_index"],
+                    entry["url_at"], model,
+                    r.get("num_infants"), r.get("num_children"),
+                    r.get("num_adults"), r.get("infant_visibility"),
+                    r.get("location"), r.get("surface"),
+                    r.get("camera_distance"), r.get("lighting"),
+                    r.get("infant_clothing"),
+                    ", ".join(r.get("objects") or []),
+                    r.get("background_complexity"), r.get("camera_motion"),
+                    r.get("image_quality"), bool(r.get("inconsistent")),
+                    r.get("description") or "",
+                    # Audio columns are simply empty for models that cannot
+                    # hear -- in a mixed-model table that is the honest cell.
+                    ", ".join(r.get("audio_events") or []),
+                    r.get("audio_description") or "",
+                ])
+        run.log({"probe": wandb.Table(columns=cols, data=rows)})
+
+        art = wandb.Artifact(f"probe-{tag}", type="model-probe")
+        art.add_file(str(dst))
+        run.log_artifact(art)
+        run.finish()
+        print(f"wandb:    run {run.name}: table ({len(rows)} rows) + "
+              f"artifact probe-{tag} (new version per write)")
 
 
 if __name__ == "__main__":
