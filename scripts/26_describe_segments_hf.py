@@ -90,6 +90,17 @@ def _preload_cuda_libs():
         roots.append(site.getusersitepackages())
     for sp in roots:
         for so in glob.glob(os.path.join(sp, "nvidia", "*", "lib", "*.so*")):
+            # NEVER load libnvblas. The nvidia-cublas wheel ships it next to
+            # libcublas, and RTLD_GLOBAL makes it interpose BLAS symbols for
+            # the whole process. It sits dormant until the first intercepted
+            # BLAS call -- the Whisper mel filterbank in the Omni audio path
+            # -- then, with no nvblas.conf and therefore no CPU fallback,
+            # jumps through a NULL pointer: SIGSEGV "at address (nil)", no
+            # traceback. That one line below cost three days of blaming
+            # audioread, LD_PRELOAD and the cluster. torchcodec needs
+            # NPP/nvrtc from these wheels; nothing here needs NVBLAS.
+            if "nvblas" in os.path.basename(so).lower():
+                continue
             try:
                 ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
             except OSError:
