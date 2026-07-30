@@ -1995,9 +1995,13 @@ def main():
                 "end_sec": round(end, 2),
                 "timestamp": f"{hhmmss(start)}-{hhmmss(end)}",
                 # Stored so a description can be audited against what the model
-                # was actually told. "audio_mode" distinguishes a genuinely
-                # silent segment (transcript "") from a video-only run (null).
-                "audio_mode": ("transcript" if asr is not None else None),
+                # was actually told. "audio_mode" distinguishes how the model
+                # got its audio: "native" (Omni hears the waveform),
+                # "transcript" (Whisper text in the prompt), null (video only).
+                # A genuinely silent segment on a transcript run is transcript
+                # "" -- different from null.
+                "audio_mode": ("native" if native_audio
+                               else "transcript" if asr is not None else None),
                 "transcript": transcript,
                 **ann,
             }
