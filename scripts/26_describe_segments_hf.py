@@ -1626,6 +1626,23 @@ def main():
                          "(writes to disk; sync from a login node afterwards).")
     args = ap.parse_args()
 
+    # NVBLAS TRIPWIRE. An LD_PRELOADed NVBLAS with no CPU BLAS configured
+    # turns some numpy BLAS calls into a jump through a NULL pointer --
+    # SIGSEGV "at address (nil)", no traceback, whole run dead. It cannot be
+    # unloaded from inside the process (the loader already mapped it), so the
+    # best this script can do is name the killer BEFORE it strikes. The
+    # launchers (28/34/sbatch) all `unset LD_PRELOAD`; seeing this warning
+    # means the shim arrived some other way (ld.so.preload, module system).
+    try:
+        if "nvblas" in Path("/proc/self/maps").read_text().lower():
+            print("WARNING: NVBLAS is preloaded into this process. If it has "
+                  "no CPU BLAS configured, numpy BLAS calls can SEGFAULT at "
+                  "address (nil) -- the audio path is the usual victim.\n"
+                  "         Launch with LD_PRELOAD unset (or fix nvblas.conf).",
+                  flush=True)
+    except OSError:
+        pass    # not Linux / maps unreadable -- nothing to check
+
     if not torch.cuda.is_available():
         raise SystemExit("no GPU -- needs an A100 allocation, not a login node.")
 

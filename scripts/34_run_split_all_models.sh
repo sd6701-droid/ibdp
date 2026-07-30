@@ -32,6 +32,11 @@ set -uo pipefail          # NOT -e: one failing model should not kill the rest
 ROOT="${ROOT:-/gpfs/scratch/sd6701/personal/ibdp}"
 SCENES_DIR="${SCENES_DIR:-$ROOT/outputs/scenes}"
 
+# Unconfigured NVBLAS preload = NULL-pointer SIGSEGV in numpy BLAS calls
+# (see the identical block in 28_run_all_models.sh). Interactive shells
+# carry it; drop it before any python starts.
+unset LD_PRELOAD
+
 SPLIT="${1:?usage: $0 split_NN [extra args forwarded to 26]}"
 shift 2>/dev/null || true
 EXTRA=("$@")

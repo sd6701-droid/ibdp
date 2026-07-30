@@ -315,6 +315,15 @@ export HF_HUB_OFFLINE=1                 # weights are local; fail fast, don't ha
 export FORCE_QWENVL_VIDEO_READER=torchcodec
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+# Some shells on this cluster carry an LD_PRELOADed NVBLAS shim with NO CPU
+# BLAS fallback configured ("CPU Blas library need to be provided"). A numpy
+# BLAS call routed to that missing fallback jumps through a NULL pointer:
+#   Caught signal 11 ... address not mapped to object at address (nil)
+# It killed the Omni runs specifically because audio feature extraction is
+# the one numpy-BLAS-heavy stage. The sbatch wrappers already unset it; this
+# script is also run INTERACTIVELY, so unset it here too.
+unset LD_PRELOAD
+
 # ---------------------------------------------------------------------------
 # W&B: ONE run PER MODEL (the default), named after the model, each carrying
 # that model's results table and system metrics -- plus the compare run at the
