@@ -120,6 +120,7 @@ def main():
         any_r = next(iter(by_model.values()))
         out[vid] = {
             "split": any_r.get("split"),
+            "chunk": any_r.get("chunk"),
             "segment_index": seg,
             "timestamp": any_r.get("timestamp"),
             "url": any_r.get("url"),
@@ -155,7 +156,7 @@ def main():
             config={"videos": videos, "split": args.split,
                     "segment": args.segment, "source": str(dst)},
         )
-        cols = ["video_id", "split", "segment", "url_at", "model",
+        cols = ["video_id", "split", "chunk", "segment", "url_at", "model",
                 "num_infants", "num_children", "num_adults",
                 "infant_visibility", "location", "surface", "camera_distance",
                 "lighting", "infant_clothing", "objects",
@@ -166,8 +167,8 @@ def main():
         for vid, entry in out.items():
             for model, r in sorted(entry["models"].items()):
                 rows.append([
-                    vid, entry["split"], entry["segment_index"],
-                    entry["url_at"], model,
+                    vid, entry["split"], r.get("chunk"),
+                    entry["segment_index"], entry["url_at"], model,
                     r.get("num_infants"), r.get("num_children"),
                     r.get("num_adults"), r.get("infant_visibility"),
                     r.get("location"), r.get("surface"),

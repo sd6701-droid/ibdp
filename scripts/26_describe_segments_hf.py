@@ -1238,8 +1238,8 @@ def table_columns(audio: bool) -> list:
     # (or link to it) is unusable the moment the table is sorted or filtered.
     # "split" is the human-readable split_NN; "url_at" deep-links to the
     # split's own start time within that video.
-    cols = ["model", "video_id", "url", "split", "segment", "timestamp",
-            "url_at", "parse_ok",
+    cols = ["model", "video_id", "url", "split", "chunk", "segment",
+            "timestamp", "url_at", "parse_ok",
             "num_infants", "num_children", "num_adults", "num_humans_total",
             "infant_visibility", "visible_parts", "inconsistent",
             "location", "surface", "camera_distance", "lighting",
@@ -1263,6 +1263,7 @@ def table_row(rec: dict, ann: dict, audio: bool) -> list:
            rec.get("video_id", ""),
            rec.get("url", ""),
            rec.get("split") or "",
+           rec.get("chunk") or "",
            rec["segment_index"], rec["timestamp"], rec["url_at"],
            bool(ann.get("parse_ok")),
            ann.get("num_infants"), ann.get("num_children"),
@@ -1875,6 +1876,11 @@ def main():
                                    f"{args.clip_max_sec:.0f}s; omni skips "
                                    f"long clips)")
                     continue
+                # "chunk" is the HUMAN-READABLE name of the processed piece:
+                # split_05_chunk_02 = second window of split_05. A clip short
+                # enough to go in whole is its own (only) chunk_01, so every
+                # scenes record carries a chunk tag and the tag alone tells
+                # you whether/how its split was subdivided.
                 if dur <= args.clip_max_sec:
                     if (vid, i * 100) in done:
                         continue
@@ -1882,6 +1888,7 @@ def main():
                                  "start": start, "end": end,
                                  "ann_start": 0.0, "ann_end": dur,
                                  "part": None, "parts": None,
+                                 "chunk": f"{sd.name}_chunk_01",
                                  "cut_confidence": sm.get("cut_confidence")})
                 else:
                     wins = segments(dur, args.seconds, args.min_tail)
@@ -1895,6 +1902,7 @@ def main():
                             "start": start + a, "end": start + b,
                             "ann_start": a, "ann_end": b,
                             "part": p, "parts": len(wins),
+                            "chunk": f"{sd.name}_chunk_{p:02d}",
                             # Only the LAST window ends on the detector's cut;
                             # interior joins are arbitrary and must not claim
                             # its confidence (same rule as scripts/32).
@@ -1928,7 +1936,7 @@ def main():
                         "i": i, "start": start, "end": end,
                         "ann_start": start, "ann_end": end,
                         "split": None, "part": None, "parts": None,
-                        "cut_confidence": None, "orig": None,
+                        "chunk": None, "cut_confidence": None, "orig": None,
                     })
 
     if skipped:
@@ -2050,6 +2058,10 @@ def main():
                 # must never pair records across modes.
                 "segmentation": seg_mode,
                 "split": w["split"],
+                # chunk: the readable name of the processed piece --
+                # split_05_chunk_02. Whole clips are their own chunk_01, so
+                # the tag is never null on a scenes record.
+                "chunk": w["chunk"],
                 # part/parts: which --seconds window of an over-long clip this
                 # is (null for a clip annotated whole). segment_index encodes
                 # the same thing as split*100+part -- these two exist so nobody
