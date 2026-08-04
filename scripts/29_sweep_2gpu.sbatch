@@ -40,5 +40,5 @@ echo "node=$(hostname) job=${SLURM_JOB_ID:-?} partition=${SLURM_JOB_PARTITION:-?
 echo "gpus=${CUDA_VISIBLE_DEVICES:-?}"
 
 # NO srun -- see 29_sweep.sbatch.
-MODELS="Qwen3-VL-30B-A3B-Instruct Qwen3-Omni-30B-A3B-Instruct Qwen3-VL-32B-Instruct InternVL3-38B" \
+MODELS="${MODELS:-Qwen3-VL-30B-A3B-Instruct Qwen3-Omni-30B-A3B-Instruct Qwen3-VL-32B-Instruct InternVL3-38B}" \
 SCENES=1 MAX_SECONDS=0 scripts/28_run_all_models.sh all
