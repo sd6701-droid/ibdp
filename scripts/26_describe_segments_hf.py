@@ -356,6 +356,22 @@ class QwenAnnotator:
             str(model_dir), dtype=torch.bfloat16, device_map=_device_map())
         self.model.eval()
 
+    def describe_text(self, prompt: str) -> str:
+        """Text-only pass through the loaded model -- used to fuse the
+        whole-video summary without loading a second checkpoint."""
+        msgs = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+        text = self.processor.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True)
+        inputs = self.processor(text=[text], return_tensors="pt"
+                                ).to(self.model.device)
+        with torch.inference_mode():
+            out = self.model.generate(
+                **inputs, max_new_tokens=400,
+                do_sample=False, repetition_penalty=1.05)
+        return self.processor.batch_decode(
+            out[:, inputs["input_ids"].shape[1]:],
+            skip_special_tokens=True)[0].strip()
+
     def annotate(self, clip: Path, start: float, end: float,
                  prompt: str = PROMPT) -> str:
         args = self.args
@@ -586,6 +602,16 @@ class InternVLAnnotator:
 
         batch = dec.get_frames_played_at(stamps)
         return batch.data          # (N, C, H, W) uint8
+
+    def describe_text(self, prompt: str) -> str:
+        """Text-only .chat() with pixel_values=None -- InternVL's own
+        supported text mode. Used for the fused whole-video summary."""
+        with torch.inference_mode():
+            out = self.model.chat(
+                self.tokenizer, None, prompt,
+                dict(max_new_tokens=400, do_sample=False,
+                     repetition_penalty=1.05))
+        return str(out).strip()
 
     def annotate(self, clip: Path, start: float, end: float,
                  prompt: str = PROMPT) -> str:
@@ -844,6 +870,25 @@ class QwenOmniAnnotator:
             # scripts/32 spent minutes producing.
             if seg is not clip:
                 seg.unlink(missing_ok=True)
+
+    def describe_text(self, prompt: str) -> str:
+        """Text-only pass through the thinker -- no audio, no video, no
+        temp files. Used for the fused whole-video summary."""
+        msgs = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+        text = self.processor.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True)
+        inputs = self.processor(text=[text], return_tensors="pt", padding=True
+                                ).to(device=self.model.device)
+        with torch.inference_mode():
+            out = self.model.generate(
+                **inputs, thinker_max_new_tokens=400,
+                do_sample=False, repetition_penalty=1.05,
+                return_audio=False)
+        if isinstance(out, (tuple, list)):
+            out = out[0]
+        return self.processor.batch_decode(
+            out[:, inputs["input_ids"].shape[1]:],
+            skip_special_tokens=True)[0].strip()
 
     def _patch_audio_loader(self):
         """Move the audio DECODE out of this process entirely.
@@ -1620,17 +1665,45 @@ def write_video_descriptions(outdir: Path, model_tag: str, prompt_sha: str,
             chunks.sort(key=lambda r: (r.get("start_sec", 0), r.get("end_sec", 0),
                                        r.get("segment_index", 0)))
             first, last = chunks[0], chunks[-1]
-            descriptions = []
-            sources = []
+
+            # ONE LINE PER SPLIT, not per chunk. A >15s split arrives as
+            # several chunks, and on static footage their descriptions repeat
+            # near-verbatim -- three lines saying "the baby sits on the sand"
+            # is noise pretending to be narrative. Chunks of the same split
+            # are merged into ONE final description spanning the whole split:
+            # exact consecutive duplicates collapse, differing chunk texts are
+            # kept in order. The per-chunk originals stay in source_chunks,
+            # so nothing is lost for auditing.
+            split_groups = []
             for rec in chunks:
-                timestamp = rec.get("timestamp") or (
-                    f"{rec.get('start_sec', 0):.2f}-{rec.get('end_sec', 0):.2f}s")
-                descriptions.append(f"[{timestamp}] {rec['description'].strip()}")
-                sources.append({"chunk": rec.get("chunk"),
-                                "segment_index": rec.get("segment_index"),
-                                "start_sec": rec.get("start_sec"),
-                                "end_sec": rec.get("end_sec"),
-                                "infant_posture": rec.get("infant_posture")})
+                key = rec.get("split") or str(rec.get("segment_index"))
+                if split_groups and split_groups[-1][0] == key:
+                    split_groups[-1][1].append(rec)
+                else:
+                    split_groups.append((key, [rec]))
+
+            descriptions, sources = [], []
+            for split_name, srecs in split_groups:
+                texts = []
+                for r in srecs:
+                    t = r["description"].strip()
+                    if not texts or texts[-1] != t:
+                        texts.append(t)
+                stamp = (f"{hhmmss(srecs[0].get('start_sec') or 0)}-"
+                         f"{hhmmss(srecs[-1].get('end_sec') or 0)}")
+                descriptions.append(f"[{stamp}] {' '.join(texts)}")
+                for r in srecs:
+                    sources.append({"split": r.get("split"),
+                                    "chunk": r.get("chunk"),
+                                    "segment_index": r.get("segment_index"),
+                                    "start_sec": r.get("start_sec"),
+                                    "end_sec": r.get("end_sec"),
+                                    # Clickable YouTube deep link to this
+                                    # chunk's moment -- spot-checking the
+                                    # narrative is a click, not a scrub.
+                                    "url_at": r.get("url_at"),
+                                    "infant_posture": r.get("infant_posture"),
+                                    "infant_actions": r.get("infant_actions")})
             fout.write(json.dumps({
                 "model": model_tag,
                 "prompt_sha": prompt_sha,
@@ -1641,6 +1714,7 @@ def write_video_descriptions(outdir: Path, model_tag: str, prompt_sha: str,
                 "start_sec": first.get("start_sec"),
                 "end_sec": last.get("end_sec"),
                 "n_chunks": len(chunks),
+                "n_splits": len(split_groups),
                 "description": "\n\n".join(descriptions),
                 "source_chunks": sources,
             }) + "\n")
@@ -1748,6 +1822,14 @@ def main():
     # any parsing -- the only way to see the difference between "model wrote
     # bad JSON", "model wrote nothing", and "parser dropped good JSON" without
     # fishing raw out of the JSONL. Loud on purpose; not for corpus runs.
+    # Fold this run's chunks into ONE fused whole-video description at the
+    # end, using the model ALREADY on the GPU (no second checkpoint load).
+    # Appends 35_video_summary.py-schema records to video_summaries.jsonl, so
+    # the two producers share one file and one resume rule. Scenes mode only.
+    ap.add_argument("--fuse-summary", default=True,
+                    action=argparse.BooleanOptionalAction,
+                    help="write a fused whole-video summary after annotating "
+                         "(--no-fuse-summary to skip)")
     ap.add_argument("--log-raw", action="store_true",
                     help="print each segment's raw model output to the log")
     ap.add_argument("--wandb", action="store_true",
@@ -2276,6 +2358,69 @@ def main():
         args.outdir, model_tag, prompt_sha, seg_mode)
     if video_descriptions is not None:
         print(f"wrote one combined description per video: {video_descriptions}")
+
+    # ---- fused whole-video summary, by the model already on the GPU -------
+    # Reuses 35_video_summary.py's timeline/prompt/schema (loaded as a module
+    # -- one source of truth), but generation goes through the annotator that
+    # is already resident, so a sweep gets its summaries for the cost of one
+    # text pass per video instead of a second checkpoint load. Fenced: a
+    # summary failure never damages the chunk corpus written above.
+    if args.fuse_summary and seg_mode == "scenes":
+        try:
+            import importlib.util as _ilu
+            _spec = _ilu.spec_from_file_location(
+                "video_summary",
+                Path(__file__).resolve().parent / "35_video_summary.py")
+            vs = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(vs)
+
+            groups = vs.load_chunks(args.outdir)
+            sum_path = args.outdir / "video_summaries.jsonl"
+            with sum_path.open("a") as fsum:
+                for vid in sorted({w["vid"] for w in work}):
+                    recs = groups.get((model_tag, "scenes", vid))
+                    if not recs:
+                        continue
+                    visual, audio_tl = vs.build_timeline(recs)
+                    if not visual and not audio_tl:
+                        continue
+                    t0 = time.time()
+                    fprompt = vs.FUSE_PROMPT.format(
+                        audio_note=(" (with notes on its soundtrack)"
+                                    if audio_tl else ""),
+                        audio_rule=(", plus 1-2 sentences on what is heard"
+                                    if audio_tl else ""),
+                        visual=visual,
+                        audio_block=(f"\nAUDIO LOG:\n{audio_tl}"
+                                     if audio_tl else ""))
+                    summary = annotator.describe_text(fprompt)
+                    starts = [r.get("start_sec") or 0 for r in recs]
+                    ends = [r.get("end_sec") or 0 for r in recs]
+                    fsum.write(json.dumps({
+                        "model": model_tag,
+                        "segmentation": "scenes",
+                        "video_id": vid,
+                        "video_name": recs[0].get("video_name"),
+                        "url": recs[0].get("url"),
+                        "n_chunks": len(recs),
+                        "span_sec": round(max(ends) - min(starts), 2),
+                        "covered_sec": round(sum(e - s for s, e
+                                                 in zip(starts, ends)), 2),
+                        "timeline": visual,
+                        "audio_timeline": audio_tl or None,
+                        "summary": summary,
+                        # This model fused its own chunks -- record that.
+                        "fuse_model": model_tag,
+                        "elapsed_sec": round(time.time() - t0, 2),
+                    }) + "\n")
+                    fsum.flush()
+                    print(f"summary [{vid}] ({len(recs)} chunks, "
+                          f"{time.time() - t0:.1f}s): {summary[:160]}"
+                          f"{'...' if len(summary) > 160 else ''}", flush=True)
+            print(f"fused summaries appended to {sum_path}", flush=True)
+        except Exception as e:
+            print(f"WARNING: fused summary step failed ({e}) -- "
+                  f"chunk records above are unaffected.", flush=True)
     dropped = getattr(annotator, "audio_dropped", 0)
     if dropped:
         print(f"WARNING: {dropped} of {n} segments produced NaN with audio and "

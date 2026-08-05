@@ -438,6 +438,31 @@ echo "ran ${#OK_MODELS[@]} ok, ${#BAD_MODELS[@]} failed, in $(( (SECONDS - t_all
 [[ ${#BAD_MODELS[@]} -gt 0 ]] && echo "failed: ${BAD_MODELS[*]}" >&2
 
 # ---------------------------------------------------------------------------
+# Whole-video descriptions (scenes runs only)
+#
+# Chunk records are the corpus; this folds them into ONE record per (model,
+# video): a deterministic time-stamped timeline plus -- when FUSE_MODEL points
+# at a checkpoint on disk -- a fused 3-6 sentence description of the entire
+# video written by that model from the timeline. SUMMARY=0 skips the step,
+# FUSE_MODEL="" keeps timelines but skips the (GPU, ~3min-load) fusion.
+# ---------------------------------------------------------------------------
+if [[ -n "$SCENES_DIR" && "${SUMMARY:-1}" == "1" && ${#OK_MODELS[@]} -gt 0 ]]; then
+  echo
+  echo "=== video summaries (timeline + fused description) ==="
+  declare -a SUM_ONLY=()
+  [[ "$VIDEO" != "all" ]] && SUM_ONLY=(--only "$VIDEO")
+  FUSE_MODEL="${FUSE_MODEL-Qwen3-VL-30B-A3B-Instruct}"
+  declare -a FUSE_ARG=()
+  if [[ -n "$FUSE_MODEL" && -d "$ROOT/models/$FUSE_MODEL" ]]; then
+    FUSE_ARG=(--fuse "$ROOT/models/$FUSE_MODEL")
+  fi
+  python scripts/35_video_summary.py --outdir "$OUTDIR" \
+      ${SUM_ONLY[@]+"${SUM_ONLY[@]}"} \
+      ${FUSE_ARG[@]+"${FUSE_ARG[@]}"} \
+      || echo "--- summary step FAILED (chunk records are unaffected)" >&2
+fi
+
+# ---------------------------------------------------------------------------
 # Compare
 # ---------------------------------------------------------------------------
 # 27 compares ONE video's records; an all-videos sweep skips it rather than
