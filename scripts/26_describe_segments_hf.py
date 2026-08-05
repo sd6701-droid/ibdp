@@ -15,6 +15,8 @@ The model is asked for JSON, not prose. Fields per segment:
     num_humans_total    int     (infants + adults; the model's own total)
     infant_visibility   "full_body" | "partial_body" | "not_visible"
     visible_infant_parts  list of head/face/torso/arms/hands/legs/feet
+    infant_posture       "sitting" | "standing" | "prone" | "supine" |
+                         "all_fours" | "other" | "not_visible"
     description         one or two sentences
 
 WHY JSON AND NOT PROSE: a free-text "describe this video" prompt produced
@@ -138,6 +140,8 @@ PROMPT = """Analyze the entire video clip and return only one valid JSON object.
         "num_humans_total":int,
         "infant_visibility":"full_body|partial_body|not_visible",
         "visible_infant_parts":["head","face","torso","arms","hands","legs","feet"],
+        "infant_posture":"sitting|standing|prone|supine|all_fours|other|not_visible",
+        "infant_actions":["touches_object","holds_object","touches_face","hand_or_object_to_mouth","claps_hands","crawls","walks","points","pulls_to_stand","sits_down_from_standing","pushes_up_from_belly","rolls_over"],
         "location":"indoor|outdoor|vehicle",
         "surface":"floor|rug_or_mat|bed|sofa|crib|highchair|held_by_person|grass|other|not_visible",
         "camera_distance":"close_up|medium|wide",
@@ -154,6 +158,8 @@ PROMPT = """Analyze the entire video clip and return only one valid JSON object.
         full_body means at least one infant is visible from head to feet at some point; 
         partial_body means an infant is visible but never fully from head to feet; 
         not_visible means no infant is visible. When no infant is visible, set visible_infant_parts to [], surface to "not_visible", and infant_clothing to "not_visible". 
+        infant_posture is the posture of the most visible infant for most of the clip: sitting = upper body upright with bottom supported by a surface; standing = body upright with weight mainly on the feet, with or without support; prone = lying chest/stomach down; supine = lying on the back, face/chest up; all_fours = on both hands and both knees. Use other when the visible infant is mainly carried, walking, or in another posture; use not_visible only when no infant is visible.
+        infant_actions lists every action from that exact list that an infant is SEEN doing at any point in the clip -- judge by sight, not by what the situation implies. Include an action once no matter how often it repeats. touches_object = any deliberate contact with an object; holds_object = grasps and keeps hold of it; hand_or_object_to_mouth = brings a hand or held object to the mouth; pulls_to_stand = rises to standing using support; pushes_up_from_belly = raises chest with arms while prone. Use [] when no infant is visible or none of the listed actions occur.
         Include each visible infant body part only once. Surface means where the infant spends most of the visible clip; 
         use held_by_person when mainly carried. close_up means one person fills most of the frame, 
         medium means people and some surroundings are visible, and wide means most of the room or scene is visible. 
@@ -162,7 +168,18 @@ PROMPT = """Analyze the entire video clip and return only one valid JSON object.
         Description must state only visible facts, including who is present, the location, the infant's posture or movement, and objects being touched."""
 
 VALID_VISIBILITY = {"full_body", "partial_body", "not_visible"}
+
+# Closed action vocabulary, same reasoning as the audio events: left open, the
+# model drifts across "grabs", "grasps", "reaches for" between segments and
+# the action counts stop aggregating. Order matches the prompt.
+INFANT_ACTIONS = ["touches_object", "holds_object", "touches_face",
+                  "hand_or_object_to_mouth", "claps_hands", "crawls", "walks",
+                  "points", "pulls_to_stand", "sits_down_from_standing",
+                  "pushes_up_from_belly", "rolls_over"]
+VALID_INFANT_ACTIONS = set(INFANT_ACTIONS)
 VALID_PARTS = {"head", "face", "torso", "arms", "hands", "legs", "feet"}
+VALID_INFANT_POSTURE = {"sitting", "standing", "prone", "supine", "all_fours",
+                        "other", "not_visible"}
 
 # Scene / recording-condition vocabularies. CLOSED for the same reason the
 # audio events are: left open, "living room" / "lounge" / "indoors" never
@@ -195,12 +212,17 @@ AUDIO_EVENTS = ["infant_vocalisation", "infant_crying", "infant_laughing",
 
 VALID_AUDIO_EVENTS = set(AUDIO_EVENTS)
 
+# live = sound recorded with the scene; overlay = added in editing (music bed,
+# narrator); mixed = both audible; none = silent track.
+VALID_AUDIO_SOURCE = {"live", "overlay", "mixed", "none"}
+
 AUDIO_PROMPT = """
 
 You can HEAR this clip as well as see it. Add these keys to the same JSON
 object:
 
   "audio_events": [%s],
+  "audio_source": "live" | "overlay" | "mixed" | "none",
   "infant_vocalising": bool,
   "speech_present": bool,
   "audio_description": "at most 2 sentences"
@@ -216,6 +238,16 @@ from. If a fact appears in both, it belongs in only one of them.
 
 - audio_events: every category actually AUDIBLE. [] if there is no sound at
   all; use "silence" only when the clip has an audio track that is silent.
+- audio_source: where the sound comes from.
+    "live"    = recorded WITH the scene: the voices and noises belong to the
+                people and objects on screen, and line up with their visible
+                actions.
+    "overlay" = added in editing: background music, a narrator's voiceover,
+                sound effects -- sound the scene itself did not make.
+    "mixed"   = both are clearly audible at once (e.g. music laid over real
+                room sound).
+    "none"    = nothing audible.
+  The tell for "overlay": sound that never reacts to what happens on screen.
 - Judge sound by EAR, not by what the picture implies. A visibly crying infant
   with no audible cry is not "infant_crying".
 - infant_vocalising covers any infant sound -- cry, babble, laugh, grunt.
@@ -1241,14 +1273,15 @@ def table_columns(audio: bool) -> list:
     cols = ["model", "video_id", "url", "split", "chunk", "segment",
             "timestamp", "url_at", "parse_ok",
             "num_infants", "num_children", "num_adults", "num_humans_total",
-            "infant_visibility", "visible_parts", "inconsistent",
+            "infant_visibility", "visible_parts", "inconsistent", "infant_posture",
+            "infant_actions",
             "location", "surface", "camera_distance", "lighting",
             "infant_clothing", "objects", "background_complexity",
             "camera_motion", "image_quality",
             "description"]
     if audio:
-        cols += ["audio_events", "infant_vocalising", "speech_present",
-                 "audio_inconsistent", "audio_description"]
+        cols += ["audio_events", "audio_source", "infant_vocalising",
+                 "speech_present", "audio_inconsistent", "audio_description"]
     cols += ["elapsed_sec"]
     return cols
 
@@ -1270,7 +1303,8 @@ def table_row(rec: dict, ann: dict, audio: bool) -> list:
            ann.get("num_adults"), ann.get("num_humans_total"),
            ann.get("infant_visibility"),
            ", ".join(ann.get("visible_infant_parts") or []),
-           bool(ann.get("inconsistent")),
+           bool(ann.get("inconsistent")), ann.get("infant_posture"),
+           ", ".join(ann.get("infant_actions") or []),
            ann.get("location"), ann.get("surface"),
            ann.get("camera_distance"), ann.get("lighting"),
            ann.get("infant_clothing"),
@@ -1283,6 +1317,7 @@ def table_row(rec: dict, ann: dict, audio: bool) -> list:
            ann.get("description") or (ann.get("raw") or "")[:500]]
     if audio:
         row += [", ".join(ann.get("audio_events") or []),
+                ann.get("audio_source"),
                 bool(ann.get("infant_vocalising")),
                 bool(ann.get("speech_present")),
                 bool(ann.get("audio_inconsistent")),
@@ -1445,6 +1480,15 @@ def parse_annotation(raw: str, audio: bool = False) -> dict:
         parts = []
     parts = [p for p in (str(x).strip().lower() for x in parts) if p in VALID_PARTS]
 
+    # Same closed-vocabulary treatment as parts: off-list actions are dropped,
+    # not kept -- "reaches_for_toy" in one segment and never again is noise in
+    # every aggregate.
+    actions = d.get("infant_actions") or []
+    if not isinstance(actions, list):
+        actions = []
+    actions = [a for a in (str(x).strip().lower() for x in actions)
+               if a in VALID_INFANT_ACTIONS]
+
     # Closed-vocabulary scene fields: an off-vocabulary answer becomes None,
     # same policy as infant_visibility -- a null is honest, a kept synonym
     # poisons every aggregate.
@@ -1466,6 +1510,8 @@ def parse_annotation(raw: str, audio: bool = False) -> dict:
         "num_humans_total": as_int(d.get("num_humans_total")),
         "infant_visibility": vis,
         "visible_infant_parts": parts,
+        "infant_actions": actions,
+        "infant_posture": as_choice("infant_posture", VALID_INFANT_POSTURE),
         "location": as_choice("location", VALID_LOCATION),
         "surface": as_choice("surface", VALID_SURFACE),
         "camera_distance": as_choice("camera_distance", VALID_DISTANCE),
@@ -1488,6 +1534,8 @@ def parse_annotation(raw: str, audio: bool = False) -> dict:
         ann["has_infant"] != (ann["num_infants"] > 0)
         or ann["has_adult"] != (ann["num_adults"] > 0)
         or (not ann["has_infant"] and ann["visible_infant_parts"])
+        or (not ann["has_infant"] and ann["infant_actions"])
+        or (not ann["has_infant"] and ann["infant_posture"] != "not_visible")
         or ann["num_humans_total"] != parts_sum
     )
 
@@ -1501,6 +1549,12 @@ def parse_annotation(raw: str, audio: bool = False) -> dict:
         events = [e for e in (str(x).strip().lower() for x in events)
                   if e in VALID_AUDIO_EVENTS]
         ann["audio_events"] = events
+        # THE OVERLAY FLAG. live = sound recorded with the scene; overlay =
+        # music bed / narrator added in editing; mixed = both; none = silent.
+        # This is the field that says whether the audio is evidence about the
+        # infant or channel post-production dressed up as evidence.
+        src = str(d.get("audio_source", "")).strip().lower()
+        ann["audio_source"] = src if src in VALID_AUDIO_SOURCE else None
         ann["infant_vocalising"] = as_bool(d.get("infant_vocalising"))
         ann["speech_present"] = as_bool(d.get("speech_present"))
         ann["audio_description"] = str(d.get("audio_description", "")).strip()
@@ -1516,10 +1570,81 @@ def parse_annotation(raw: str, audio: bool = False) -> dict:
             ("silence" in events and len(events) > 1)
             or (ann["infant_vocalising"] and not (infant_sounds & set(events)))
             or (ann["speech_present"] and not (speech_sounds & set(events)))
+            # source says silent but events name real sounds, or vice versa
+            or (ann["audio_source"] == "none"
+                and events and events != ["silence"])
+            or (ann["audio_source"] in ("live", "overlay", "mixed")
+                and events == ["silence"])
         )
 
     ann["parse_ok"] = True
     return ann
+
+
+def write_video_descriptions(outdir: Path, model_tag: str, prompt_sha: str,
+                             segmentation: str) -> Path | None:
+    """Write one chronological, combined description per video.
+
+    Source annotations remain chunk-level for auditability.  This companion
+    JSONL is rebuilt from all matching runs, so a resumed batch job includes
+    chunks written by an earlier job rather than describing only its last
+    partial batch.
+    """
+    latest = {}
+    for path in sorted(outdir.glob("annotations_*.jsonl")):
+        with path.open() as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (rec.get("model") != model_tag
+                        or rec.get("prompt_sha") != prompt_sha
+                        or rec.get("segmentation") != segmentation
+                        or not rec.get("parse_ok")
+                        or not rec.get("description")
+                        or not rec.get("video_id")):
+                    continue
+                key = (rec["video_id"], rec.get("chunk") or rec.get("segment_index"))
+                latest[key] = rec  # a later re-run of the same chunk wins
+
+    by_video = {}
+    for (video_id, _), rec in latest.items():
+        by_video.setdefault(video_id, []).append(rec)
+    if not by_video:
+        return None
+
+    out = outdir / f"video_descriptions_{model_tag}_{prompt_sha}.jsonl"
+    with out.open("w") as fout:
+        for video_id, chunks in sorted(by_video.items()):
+            chunks.sort(key=lambda r: (r.get("start_sec", 0), r.get("end_sec", 0),
+                                       r.get("segment_index", 0)))
+            first, last = chunks[0], chunks[-1]
+            descriptions = []
+            sources = []
+            for rec in chunks:
+                timestamp = rec.get("timestamp") or (
+                    f"{rec.get('start_sec', 0):.2f}-{rec.get('end_sec', 0):.2f}s")
+                descriptions.append(f"[{timestamp}] {rec['description'].strip()}")
+                sources.append({"chunk": rec.get("chunk"),
+                                "segment_index": rec.get("segment_index"),
+                                "start_sec": rec.get("start_sec"),
+                                "end_sec": rec.get("end_sec"),
+                                "infant_posture": rec.get("infant_posture")})
+            fout.write(json.dumps({
+                "model": model_tag,
+                "prompt_sha": prompt_sha,
+                "video_id": video_id,
+                "video_name": first.get("video_name"),
+                "url": first.get("url"),
+                "segmentation": segmentation,
+                "start_sec": first.get("start_sec"),
+                "end_sec": last.get("end_sec"),
+                "n_chunks": len(chunks),
+                "description": "\n\n".join(descriptions),
+                "source_chunks": sources,
+            }) + "\n")
+    return out
 
 
 def main():
@@ -2147,6 +2272,10 @@ def main():
     print(f"\n{ok} parsed, {bad} unparseable, of {n} segments "
           f"in {total/60:.1f} min ({total/max(ok+bad,1):.1f}s each)")
     print(f"wrote {args.out}")
+    video_descriptions = write_video_descriptions(
+        args.outdir, model_tag, prompt_sha, seg_mode)
+    if video_descriptions is not None:
+        print(f"wrote one combined description per video: {video_descriptions}")
     dropped = getattr(annotator, "audio_dropped", 0)
     if dropped:
         print(f"WARNING: {dropped} of {n} segments produced NaN with audio and "
@@ -2163,6 +2292,8 @@ def main():
             "total_minutes": total / 60,
             "sec_per_segment": total / max(ok + bad, 1),
             "output_file": args.out.name,
+            "video_descriptions_file": (
+                video_descriptions.name if video_descriptions is not None else None),
         }
         # Same collision problem as the metrics: in a shared run the last model
         # to finish would otherwise be the only one whose summary survives.
