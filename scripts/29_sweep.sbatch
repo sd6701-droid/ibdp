@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ibdp-sweep
 #SBATCH --partition=a100_long        # the multi-model sweep does not fit a100_short's 4h
-#SBATCH --gres=gpu:a100:3            # 4 cards so the 72B/78B fit; 2 is enough if MODELS excludes them
+#SBATCH --gres=gpu:a100:4            # 4 cards so the 72B/78B fit; 2 is enough if MODELS excludes them
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --time=24:00:00
