@@ -42,7 +42,7 @@ LEGACY_MODEL_TAG = "Qwen3-VL-30B-A3B-Instruct"
 # Compared by default. Ordered: the counts first, since those are what the
 # downstream aggregation actually uses.
 FIELDS = ["num_infants", "num_adults", "num_children", "num_humans_total",
-          "has_infant", "infant_visibility",
+          "has_infant", "infant_visibility", "infant_posture",
           # Scene fields, closed-vocabulary strings compared by equality just
           # like infant_visibility. "objects" is deliberately absent: a free
           # list where "toy car" vs "toy" counts as total disagreement says

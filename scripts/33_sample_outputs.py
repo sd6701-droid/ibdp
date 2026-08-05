@@ -158,11 +158,12 @@ def main():
         )
         cols = ["video_id", "split", "chunk", "segment", "url_at", "model",
                 "num_infants", "num_children", "num_adults",
-                "infant_visibility", "location", "surface", "camera_distance",
+                "infant_visibility", "infant_posture", "infant_actions",
+                "location", "surface", "camera_distance",
                 "lighting", "infant_clothing", "objects",
                 "background_complexity", "camera_motion", "image_quality",
                 "inconsistent", "description",
-                "audio_events", "audio_description"]
+                "audio_events", "audio_source", "audio_description"]
         rows = []
         for vid, entry in out.items():
             for model, r in sorted(entry["models"].items()):
@@ -171,6 +172,8 @@ def main():
                     entry["segment_index"], entry["url_at"], model,
                     r.get("num_infants"), r.get("num_children"),
                     r.get("num_adults"), r.get("infant_visibility"),
+                    r.get("infant_posture"),
+                    ", ".join(r.get("infant_actions") or []),
                     r.get("location"), r.get("surface"),
                     r.get("camera_distance"), r.get("lighting"),
                     r.get("infant_clothing"),
@@ -181,6 +184,7 @@ def main():
                     # Audio columns are simply empty for models that cannot
                     # hear -- in a mixed-model table that is the honest cell.
                     ", ".join(r.get("audio_events") or []),
+                    r.get("audio_source") or "",
                     r.get("audio_description") or "",
                 ])
         run.log({"probe": wandb.Table(columns=cols, data=rows)})
