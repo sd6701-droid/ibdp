@@ -49,6 +49,10 @@ datasets/*
 !datasets/chambers_infant_youtube/
 datasets/chambers_infant_youtube/*
 !datasets/chambers_infant_youtube/URL_labelled_dataset.csv
+# The same URL list at the checkout root, which is where it lands on the
+# cluster. Leading slash anchors this to the repo root, so it re-includes only
+# that one file and not any other URL_labelled_dataset.csv deeper in the tree.
+!/URL_labelled_dataset.csv
 
 # ViTPose overlay clips + keypoint JSON pulled from the cluster
 pose_videos/
