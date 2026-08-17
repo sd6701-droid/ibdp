@@ -301,8 +301,15 @@ def main():
                          "(tmux is your friend: this takes a while).")
 
     runtime = js_runtime()
+    if runtime and not args.js_runtime and runtime != "deno":
+        # yt-dlp auto-detects ONLY deno. node/bun exist but stay disabled until
+        # named explicitly, so finding one on PATH is not enough -- without
+        # this yt-dlp would degrade to android_vr while we report a runtime.
+        args.js_runtime = runtime
     if runtime:
-        print(f"js runtime: {runtime}", flush=True)
+        print(f"js runtime: {runtime}"
+              f"{' (passed via --js-runtimes)' if args.js_runtime else ''}",
+              flush=True)
     elif not args.js_runtime:
         # Not fatal -- some videos still come through -- but it is by far the
         # most likely reason for a run that reports most of the dataset as
