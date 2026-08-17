@@ -35,6 +35,20 @@ TWO THINGS TO KNOW:
 2. YouTube videos go private or get deleted. Failures are expected and are
    NOT fatal: every id that did not land on disk is written to missing.txt
    with the row it came from, and the run exits 0. Re-run later to retry.
+
+BEFORE YOU BELIEVE missing.txt: yt-dlp needs a JavaScript runtime to solve
+YouTube's player challenge. Without one it falls back to the `android_vr`
+client, which reports `Video unavailable` for videos that play fine in a
+browser -- so a missing runtime looks identical to a dead dataset. Install
+deno once (login node, it needs internet) and the false failures go away:
+
+    curl -fsSL https://deno.land/install.sh | sh
+    export PATH="$HOME/.deno/bin:$PATH"     # add to ~/.bashrc to keep it
+    pip install -U "yt-dlp[default]"        # + curl_cffi, for impersonation
+
+The script warns loudly when no runtime is on PATH. If videos still fail
+after that, try --player-client (e.g. 'default,web_safari') and then
+--cookies; only what survives all three is genuinely gone.
 """
 import argparse
 import csv
@@ -99,7 +113,21 @@ def have_network() -> bool:
         return False
 
 
-def download(ids: list[str], dest: Path, log: Path, rate_limit: str | None) -> int:
+def js_runtime() -> str | None:
+    """The JS runtime yt-dlp will pick up off PATH, if any.
+
+    Modern yt-dlp needs one to solve YouTube's player challenge. WITHOUT IT it
+    quietly falls back to the `android_vr` client, which reports
+    `ERROR: <id>: Video unavailable` for videos that play fine in a browser --
+    so a missing runtime looks exactly like a dead dataset. Hence the loud
+    warning at the call site rather than a silent degrade."""
+    for runtime in ("deno", "node", "bun"):
+        if shutil.which(runtime):
+            return runtime
+    return None
+
+
+def download(ids: list[str], dest: Path, log: Path, args) -> int:
     """Hand every id to yt-dlp in one batch. Returns its exit code; non-zero is
     normal here because --ignore-errors keeps going past dead videos."""
     urls = dest / "urls.txt"
@@ -127,8 +155,18 @@ def download(ids: list[str], dest: Path, log: Path, rate_limit: str | None) -> i
         "--no-overwrites",
         "--progress",
     ]
-    if rate_limit:
-        cmd += ["--limit-rate", rate_limit]
+    if args.rate_limit:
+        cmd += ["--limit-rate", args.rate_limit]
+    if args.cookies:
+        # Exported browser cookies. The single most effective answer to both
+        # "Sign in to confirm you're not a bot" and age/region gates from a
+        # datacenter IP -- which is what a BigPurple login node looks like.
+        cmd += ["--cookies", str(args.cookies)]
+    if args.player_client:
+        cmd += ["--extractor-args", f"youtube:player_client={args.player_client}"]
+    if args.js_runtime:
+        cmd += ["--js-runtimes", args.js_runtime]
+    cmd += args.ytdlp_arg
     print(f"downloading {len(ids)} video(s) -> {dest / 'videos'}", flush=True)
     with log.open("a") as fh:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
@@ -195,6 +233,21 @@ def main():
                     help="only the first N unique videos (for a smoke test)")
     ap.add_argument("--rate-limit", default=None,
                     help="yt-dlp --limit-rate, e.g. 5M")
+    ap.add_argument("--cookies", type=Path, default=None,
+                    help="exported cookies.txt -- the fix for 'Sign in to "
+                         "confirm you're not a bot' and age-gated videos")
+    ap.add_argument("--player-client", default=None,
+                    help="youtube:player_client extractor arg, e.g. "
+                         "'default,web_safari' or 'tv'. Try this when videos "
+                         "report 'Video unavailable' but play in a browser.")
+    ap.add_argument("--js-runtime", default=None,
+                    help="yt-dlp --js-runtimes value, e.g. 'deno:/path/to/deno'. "
+                         "Only needed when the runtime is NOT on PATH.")
+    ap.add_argument("--ytdlp-arg", action="append", default=[], metavar="ARG",
+                    help="pass an extra flag straight through to yt-dlp; "
+                         "repeatable")
+    ap.add_argument("--force", action="store_true",
+                    help="retry ids already recorded in downloaded.txt")
     args = ap.parse_args()
 
     dest = args.dest or (args.root / DEST)
@@ -242,12 +295,34 @@ def main():
                          "compute node. Log into a login node and run there "
                          "(tmux is your friend: this takes a while).")
 
+    runtime = js_runtime()
+    if runtime:
+        print(f"js runtime: {runtime}", flush=True)
+    elif not args.js_runtime:
+        # Not fatal -- some videos still come through -- but it is by far the
+        # most likely reason for a run that reports most of the dataset as
+        # "Video unavailable", so say so before burning an hour on it.
+        print("WARNING: no JavaScript runtime (deno/node/bun) on PATH.\n"
+              "         yt-dlp falls back to the android_vr client, which\n"
+              "         reports 'Video unavailable' for videos that are fine.\n"
+              "         Install one, then re-run:\n"
+              "           curl -fsSL https://deno.land/install.sh | sh\n"
+              "           export PATH=\"$HOME/.deno/bin:$PATH\"\n"
+              "         Also worth having, for the impersonation warning:\n"
+              "           pip install -U 'yt-dlp[default]'\n", file=sys.stderr)
+
+    if args.force:
+        # yt-dlp skips anything in the archive, so a retry after a bad run
+        # would be a no-op. Drop the record; files on disk still win via
+        # --no-overwrites and the `already` filter below.
+        (dest / "downloaded.txt").unlink(missing_ok=True)
+
     already = {i for i in ids if video_path(dest, i)}
     todo = [i for i in ids if i not in already]
     if already:
         print(f"{len(already)} already on disk, {len(todo)} to fetch", flush=True)
     if todo:
-        download(todo, dest, dest / "logs" / "download.log", args.rate_limit)
+        download(todo, dest, dest / "logs" / "download.log", args)
 
     write_manifest(manifest, labels, dest)
 
