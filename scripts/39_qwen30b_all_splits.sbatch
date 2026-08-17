@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=ibdp-30b-splits
-#SBATCH --partition=gl40s            # L40S nodes; verify the name: sinfo -o "%P %G" | grep -i l40
+#SBATCH --partition=gl40s_long       # L40S nodes (8 per node); _long for the 24h walltime
 #SBATCH --gres=gpu:l40s:2            # 2x 48GB L40S = 96GB, shards the ~61GB 30B-A3B across both
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
