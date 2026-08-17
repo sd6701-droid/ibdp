@@ -152,7 +152,9 @@ def download(ids: list[str], dest: Path, log: Path, args) -> int:
         # Politeness: 101 videos back to back off one IP invites throttling.
         "--sleep-requests", "1", "--sleep-interval", "2", "--max-sleep-interval", "6",
         "--ignore-errors",
-        "--no-overwrites",
+        # --force re-fetches on purpose, so it must also lift yt-dlp's own
+        # refusal to clobber -- otherwise the download is a silent no-op.
+        "--force-overwrites" if args.force else "--no-overwrites",
         "--progress",
     ]
     if args.rate_limit:
@@ -247,7 +249,10 @@ def main():
                     help="pass an extra flag straight through to yt-dlp; "
                          "repeatable")
     ap.add_argument("--force", action="store_true",
-                    help="retry ids already recorded in downloaded.txt")
+                    help="re-download everything, OVERWRITING videos already "
+                         "on disk. Not needed to retry failures -- only "
+                         "successes are archived, so a plain re-run already "
+                         "retries whatever is in missing.txt.")
     args = ap.parse_args()
 
     dest = args.dest or (args.root / DEST)
@@ -312,14 +317,18 @@ def main():
               "           pip install -U 'yt-dlp[default]'\n", file=sys.stderr)
 
     if args.force:
-        # yt-dlp skips anything in the archive, so a retry after a bad run
-        # would be a no-op. Drop the record; files on disk still win via
-        # --no-overwrites and the `already` filter below.
+        # Re-fetch EVERYTHING, including videos already on disk. Both skip
+        # layers have to come off together: dropping the archive alone leaves
+        # the `already` filter below to short-circuit the same files, which
+        # makes the flag look like it worked while changing nothing.
         (dest / "downloaded.txt").unlink(missing_ok=True)
 
-    already = {i for i in ids if video_path(dest, i)}
+    already = set() if args.force else {i for i in ids if video_path(dest, i)}
     todo = [i for i in ids if i not in already]
-    if already:
+    if args.force:
+        print(f"--force: re-downloading all {len(todo)}, existing files "
+              f"will be overwritten", flush=True)
+    elif already:
         print(f"{len(already)} already on disk, {len(todo)} to fetch", flush=True)
     if todo:
         download(todo, dest, dest / "logs" / "download.log", args)
