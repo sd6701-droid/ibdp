@@ -106,3 +106,8 @@ Chamber-etal-dataset/
 *.key
 *.pem
 secrets.yaml
+# Exported YouTube cookies are live session credentials for a Google account --
+# anyone with the file is signed in as you. gitpush.sh runs `git add .`, so
+# these must be ignored by name rather than by remembering not to stage them.
+cookies*.txt
+*cookies.txt
