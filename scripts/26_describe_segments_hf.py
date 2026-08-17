@@ -142,6 +142,7 @@ PROMPT = """Analyze the entire video clip and return only one valid JSON object.
         "visible_infant_parts":["head","face","torso","arms","hands","legs","feet"],
         "infant_posture":"sitting|standing|prone|supine|all_fours|other|not_visible",
         "infant_actions":["touches_object","holds_object","touches_face","hand_or_object_to_mouth","claps_hands","crawls","walks","points","pulls_to_stand","sits_down_from_standing","pushes_up_from_belly","rolls_over"],
+        "child_actions":["walks"],
         "location":"indoor|outdoor|vehicle",
         "surface":"floor|rug_or_mat|bed|sofa|crib|highchair|held_by_person|grass|other|not_visible",
         "camera_distance":"close_up|medium|wide",
@@ -160,6 +161,7 @@ PROMPT = """Analyze the entire video clip and return only one valid JSON object.
         not_visible means no infant is visible. When no infant is visible, set visible_infant_parts to [], surface to "not_visible", and infant_clothing to "not_visible". 
         infant_posture is the posture of the most visible infant for most of the clip: sitting = upper body upright with bottom supported by a surface; standing = body upright with weight mainly on the feet, with or without support; prone = lying chest/stomach down; supine = lying on the back, face/chest up; all_fours = on both hands and both knees. Use other when the visible infant is mainly carried, walking, or in another posture; use not_visible only when no infant is visible.
         infant_actions lists every action from that exact list that an infant is SEEN doing at any point in the clip -- judge by sight, not by what the situation implies. Include an action once no matter how often it repeats. touches_object = any deliberate contact with an object; holds_object = grasps and keeps hold of it; hand_or_object_to_mouth = brings a hand or held object to the mouth; pulls_to_stand = rises to standing using support; pushes_up_from_belly = raises chest with arms while prone. Use [] when no infant is visible or none of the listed actions occur.
+        child_actions lists actions from its exact list that any CHILD is SEEN doing at any point in the clip. A child is walking only when independently taking steps; do not label standing, being carried, or supported stepping as walks. Use [] when no child is visible or no listed action occurs.
         Include each visible infant body part only once. Surface means where the infant spends most of the visible clip; 
         use held_by_person when mainly carried. close_up means one person fills most of the frame, 
         medium means people and some surroundings are visible, and wide means most of the room or scene is visible. 
@@ -177,6 +179,8 @@ INFANT_ACTIONS = ["touches_object", "holds_object", "touches_face",
                   "points", "pulls_to_stand", "sits_down_from_standing",
                   "pushes_up_from_belly", "rolls_over"]
 VALID_INFANT_ACTIONS = set(INFANT_ACTIONS)
+CHILD_ACTIONS = ["walks"]
+VALID_CHILD_ACTIONS = set(CHILD_ACTIONS)
 VALID_PARTS = {"head", "face", "torso", "arms", "hands", "legs", "feet"}
 VALID_INFANT_POSTURE = {"sitting", "standing", "prone", "supine", "all_fours",
                         "other", "not_visible"}
@@ -1319,7 +1323,7 @@ def table_columns(audio: bool) -> list:
             "timestamp", "url_at", "parse_ok",
             "num_infants", "num_children", "num_adults", "num_humans_total",
             "infant_visibility", "visible_parts", "inconsistent", "infant_posture",
-            "infant_actions",
+            "infant_actions", "child_actions",
             "location", "surface", "camera_distance", "lighting",
             "infant_clothing", "objects", "background_complexity",
             "camera_motion", "image_quality",
@@ -1350,6 +1354,7 @@ def table_row(rec: dict, ann: dict, audio: bool) -> list:
            ", ".join(ann.get("visible_infant_parts") or []),
            bool(ann.get("inconsistent")), ann.get("infant_posture"),
            ", ".join(ann.get("infant_actions") or []),
+           ", ".join(ann.get("child_actions") or []),
            ann.get("location"), ann.get("surface"),
            ann.get("camera_distance"), ann.get("lighting"),
            ann.get("infant_clothing"),
@@ -1534,6 +1539,12 @@ def parse_annotation(raw: str, audio: bool = False) -> dict:
     actions = [a for a in (str(x).strip().lower() for x in actions)
                if a in VALID_INFANT_ACTIONS]
 
+    child_actions = d.get("child_actions") or []
+    if not isinstance(child_actions, list):
+        child_actions = []
+    child_actions = [a for a in (str(x).strip().lower() for x in child_actions)
+                     if a in VALID_CHILD_ACTIONS]
+
     # Closed-vocabulary scene fields: an off-vocabulary answer becomes None,
     # same policy as infant_visibility -- a null is honest, a kept synonym
     # poisons every aggregate.
@@ -1556,6 +1567,7 @@ def parse_annotation(raw: str, audio: bool = False) -> dict:
         "infant_visibility": vis,
         "visible_infant_parts": parts,
         "infant_actions": actions,
+        "child_actions": child_actions,
         "infant_posture": as_choice("infant_posture", VALID_INFANT_POSTURE),
         "location": as_choice("location", VALID_LOCATION),
         "surface": as_choice("surface", VALID_SURFACE),
@@ -1580,6 +1592,7 @@ def parse_annotation(raw: str, audio: bool = False) -> dict:
         or ann["has_adult"] != (ann["num_adults"] > 0)
         or (not ann["has_infant"] and ann["visible_infant_parts"])
         or (not ann["has_infant"] and ann["infant_actions"])
+        or (ann["num_children"] == 0 and ann["child_actions"])
         or (not ann["has_infant"] and ann["infant_posture"] != "not_visible")
         or ann["num_humans_total"] != parts_sum
     )
@@ -1703,7 +1716,8 @@ def write_video_descriptions(outdir: Path, model_tag: str, prompt_sha: str,
                                     # narrative is a click, not a scrub.
                                     "url_at": r.get("url_at"),
                                     "infant_posture": r.get("infant_posture"),
-                                    "infant_actions": r.get("infant_actions")})
+                                    "infant_actions": r.get("infant_actions"),
+                                    "child_actions": r.get("child_actions")})
             fout.write(json.dumps({
                 "model": model_tag,
                 "prompt_sha": prompt_sha,
