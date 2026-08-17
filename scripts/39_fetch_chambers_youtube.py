@@ -168,6 +168,16 @@ def download(ids: list[str], dest: Path, log: Path, args) -> int:
         cmd += ["--extractor-args", f"youtube:player_client={args.player_client}"]
     if args.js_runtime:
         cmd += ["--js-runtimes", args.js_runtime]
+    if args.slow:
+        # Answer to `HTTP Error 403: Forbidden` on the media fetch: that is
+        # YouTube throttling a datacenter IP that asked for too much too fast,
+        # not a broken video. One fragment at a time and longer gaps trade
+        # wall-clock for a much higher completion rate. Appended last so these
+        # win over the defaults set above.
+        cmd += ["--concurrent-fragments", "1",
+                "--sleep-requests", "3",
+                "--sleep-interval", "5", "--max-sleep-interval", "15",
+                "--retry-sleep", "http:exp=2:60"]
     cmd += args.ytdlp_arg
     print(f"downloading {len(ids)} video(s) -> {dest / 'videos'}", flush=True)
     with log.open("a") as fh:
@@ -245,9 +255,14 @@ def main():
     ap.add_argument("--js-runtime", default=None,
                     help="yt-dlp --js-runtimes value, e.g. 'deno:/path/to/deno'. "
                          "Only needed when the runtime is NOT on PATH.")
+    ap.add_argument("--slow", action="store_true",
+                    help="one fragment at a time + longer sleeps. Use when the "
+                         "log shows 'HTTP Error 403: Forbidden' -- that is "
+                         "throttling, not a dead video.")
     ap.add_argument("--ytdlp-arg", action="append", default=[], metavar="ARG",
                     help="pass an extra flag straight through to yt-dlp; "
-                         "repeatable")
+                         "repeatable. MUST use = form, since the value itself "
+                         "starts with a dash: --ytdlp-arg=--no-check-certificate")
     ap.add_argument("--force", action="store_true",
                     help="re-download everything, OVERWRITING videos already "
                          "on disk. Not needed to retry failures -- only "
