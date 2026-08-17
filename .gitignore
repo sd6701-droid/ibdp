@@ -38,6 +38,18 @@ youtube_dataset/
 downloaded.txt
 missing.txt
 
+# Chambers et al. labelled YouTube dataset (scripts/39). On the cluster the
+# downloaded videos land INSIDE the checkout, so ignore the tree by default and
+# re-include ONLY the URL list. That CSV is public YouTube urls + label windows
+# from the published release -- no PHI, and it is the input the script needs, so
+# it is the one file here that belongs in git.
+# Order matters: `datasets/*` (not `datasets/`) leaves the directory itself
+# un-excluded, which is what lets the negations below re-include a path under it.
+datasets/*
+!datasets/chambers_infant_youtube/
+datasets/chambers_infant_youtube/*
+!datasets/chambers_infant_youtube/URL_labelled_dataset.csv
+
 # ViTPose overlay clips + keypoint JSON pulled from the cluster
 pose_videos/
 
@@ -84,6 +96,7 @@ build/
 .pytest_cache/
 .ruff_cache/
 
+Chamber-etal-dataset/
 # Secrets
 .env.local
 *.key
