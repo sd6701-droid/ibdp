@@ -92,9 +92,23 @@ def main():
     ap.add_argument("--palette", choices=sorted(PALETTES), default="repo")
     ap.add_argument("--order", type=int, default=1,
                     help="polynomial order for the regression fit")
+    ap.add_argument("--label", action="store_true",
+                    help="number every point and write a <out>_labels.csv "
+                         "mapping number -> video, so an outlier on the plot "
+                         "can be traced back to the video that produced it")
     args = ap.parse_args()
 
     df = load(args.reference, args.clinical)
+
+    # Stable point numbers, assigned once over the whole frame and sorted by
+    # group then video, so the same video carries the same number in every
+    # panel AND across re-runs. Numbering per-panel would be useless -- the
+    # whole point is tracing one dot through all twelve.
+    if args.label:
+        idcol = "video" if "video" in df.columns else df.columns[0]
+        df = df.sort_values(["risk", idcol]).reset_index(drop=True)
+        df["point"] = range(1, len(df) + 1)
+
     present = sorted(df["risk"].dropna().unique())
     print(f"{len(df)} rows, risk groups present: {present}")
     for r, name in GROUPS:
@@ -121,6 +135,14 @@ def main():
                         scatter_kws={"s": 18, "alpha": 0.6},
                         line_kws={"linewidth": 2},
                         label=f"{name} (n={len(sub)})")
+            if args.label:
+                for _, row in sub.iterrows():
+                    if pd.isna(row[feat]):
+                        continue
+                    ax.annotate(str(int(row["point"])),
+                                (row["age_in_weeks"], row[feat]),
+                                fontsize=6, alpha=0.9,
+                                xytext=(2, 2), textcoords="offset points")
         ax.set_xlabel("age (weeks)")
         ax.set_ylabel(LABELS.get(feat, feat))
         ax.set_title(feat, fontsize=10)
@@ -136,6 +158,14 @@ def main():
     fig.savefig(args.out, bbox_inches="tight")
     fig.savefig(args.out.with_suffix(".png"), dpi=150, bbox_inches="tight")
     print(f"\n{args.out}\n{args.out.with_suffix('.png')}")
+
+    if args.label:
+        idcol = "video" if "video" in df.columns else df.columns[0]
+        keep = [c for c in ("point", idcol, "age_in_weeks", "risk", "infant_id")
+                if c in df.columns]
+        table = args.out.with_name(args.out.stem + "_labels.csv")
+        df[keep].to_csv(table, index=False)
+        print(table)
 
 
 if __name__ == "__main__":
