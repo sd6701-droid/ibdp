@@ -111,3 +111,7 @@ secrets.yaml
 # these must be ignored by name rather than by remembering not to stage them.
 cookies*.txt
 *cookies.txt
+
+# Chambers et al. released source bundle (repo zips, pose CSVs, PDFs) --
+# reference material we read, not code we maintain.
+chamber_et_al_src/
