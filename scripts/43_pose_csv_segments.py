@@ -26,6 +26,11 @@ Clips shorter than --skip-start + --min-keep are SKIPPED, not silently
 truncated: some scene splits are only 3-4s long, and 1s of pose is not worth
 a feature row that looks as legitimate as any other.
 """
+# Python 3.9 in the vitpose env: PEP 604 unions (X | None) in annotations
+# are a runtime TypeError there, not just a syntax nicety. This defers all
+# annotation evaluation so the same file runs on 3.9 and 3.12 alike.
+from __future__ import annotations
+
 import argparse
 import csv
 import re
