@@ -1,0 +1,6 @@
+# pandas pinned <2.2: the Chambers et al. groupby/apply idioms predate the
+# include_groups deprecation; >=2 needs the small compat edits noted in README.
+numpy<2
+pandas>=2,<2.2
+scipy
+matplotlib
