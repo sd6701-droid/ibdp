@@ -35,4 +35,8 @@ cd "${SLURM_SUBMIT_DIR:-$ROOT}"
 
 echo "node=$(hostname) job=${SLURM_JOB_ID:-?} gpus=${CUDA_VISIBLE_DEVICES:-?}"
 
-srun python scripts/43_pose_csv_segments.py "$@"
+# --skip-start is stated here rather than left to the driver default, so the
+# job record shows what was actually run. "$@" comes after, so anything you
+# pass at submit time still wins (argparse takes the last occurrence):
+#   sbatch scripts/43_pose_csv_segments.sbatch --skip-start 0
+srun python scripts/43_pose_csv_segments.py --skip-start 2 "$@"
