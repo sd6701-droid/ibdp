@@ -115,3 +115,10 @@ cookies*.txt
 # Chambers et al. released source bundle (repo zips, pose CSVs, PDFs) --
 # reference material we read, not code we maintain.
 chamber_et_al_src/
+
+# kinematics/src/data is Chambers-pipeline CODE (convert/preprocess/features
+# stages), not data -- the blanket data/ PHI guard at the top must not swallow
+# it. The negation re-includes ONLY that directory; generated outputs still
+# never reach git (kinematics/data/ stays covered by data/, and the csv/pkl
+# patterns catch strays).
+!kinematics/src/data/
