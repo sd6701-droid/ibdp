@@ -84,6 +84,27 @@ def main():
     print('  ' + str(pkl.resolve()))
     print('  ' + str(csv.resolve()))
 
+    # Per-video copies NEXT TO pred/ and vis/, so each pose folder is
+    # self-contained: <poses_root>/<video_id>/kinematics/ gets the feature row
+    # and the per-frame time series, each as pkl + csv. The central copies
+    # above stay the aggregate across videos.
+    coords = pd.read_pickle(est / 'processed_pose_estimates_coords.pkl')
+    angles = pd.read_pickle(est / 'processed_pose_estimates_angles.pkl')
+    for vid, vrow in features.groupby('video'):
+        vdir = poses_root / str(vid) / 'kinematics'
+        if not vdir.parent.is_dir():
+            continue        # video processed in an earlier run from another root
+        vdir.mkdir(exist_ok=True)
+        vrow.to_pickle(vdir / 'features.pkl')
+        vrow.to_csv(vdir / 'features.csv', index=False)
+        vc = coords[coords.video == vid]
+        va = angles[angles.video == vid]
+        vc.to_pickle(vdir / 'timeseries_coords.pkl')
+        vc.to_csv(vdir / 'timeseries_coords.csv', index=False)
+        va.to_pickle(vdir / 'timeseries_angles.pkl')
+        va.to_csv(vdir / 'timeseries_angles.csv', index=False)
+        print('  ' + str(vdir) + '  (features + timeseries, pkl + csv)')
+
 
 if __name__ == '__main__':
     main()
