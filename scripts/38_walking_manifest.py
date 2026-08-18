@@ -119,14 +119,24 @@ def main():
     walking, n_seen = make_cohort(
         child_records, lambda r: "walks" in (r.get("child_actions") or []),
         args.min_models)
+    # Every split where a child is upright, walking or standing, and NOTHING
+    # else -- a split whose child_actions is [] (only sitting, crawling, being
+    # carried, or no child at all) never reaches this CSV. The child_actions
+    # column says which of the two it was, so one file serves both cohorts.
+    upright, _ = make_cohort(
+        child_records,
+        lambda r: bool({"walks", "stands"} & set(r.get("child_actions") or [])),
+        args.min_models)
     supine, _ = make_cohort(
         records,
         lambda r: r.get("num_infants", 0) > 0 and r.get("infant_posture") == "supine",
         args.min_models)
 
     walking_csv = args.outdir / "children_walking_segments.csv"
+    upright_csv = args.outdir / "children_walk_or_stand_segments.csv"
     supine_csv = args.outdir / "infants_supine_segments.csv"
     write_csv(walking_csv, walking)
+    write_csv(upright_csv, upright)
     write_csv(supine_csv, supine)
     walking_ids = args.outdir / "children_walking_video_ids.txt"
     supine_ids = args.outdir / "infants_supine_video_ids.txt"
@@ -134,8 +144,9 @@ def main():
     supine_ids.write_text("\n".join(sorted({r["video_id"] for r in supine})) + ("\n" if supine else ""))
 
     print(f"annotated scene splits: {n_seen}")
-    print(f"children walking: {len(walking)} -> {walking_csv}")
-    print(f"infants supine : {len(supine)} -> {supine_csv}")
+    print(f"children walking     : {len(walking)} -> {walking_csv}")
+    print(f"children walk/stand  : {len(upright)} -> {upright_csv}")
+    print(f"infants supine       : {len(supine)} -> {supine_csv}")
     if not walking:
         print("note: child walking needs new annotations containing child_actions")
 
