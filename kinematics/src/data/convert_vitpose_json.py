@@ -126,9 +126,11 @@ def main(data_set, poses_root, score_threshold=0.3,
         source = find_video(video_dir)
         ifps, ipx, ipy = probe_video(source) if source else (None, None, None)
         ifps, ipx, ipy = ifps or fps, ipx or pixel_x, ipy or pixel_y
-        assert ifps and ipx and ipy, \
-            (video + ': no readable source video next to pred/ -- pass fps, '
-             'pixel_x and pixel_y')
+        if not (ifps and ipx and ipy):
+            # One bad video must not abort a 60-video batch: skip loudly.
+            print('SKIP ' + video + ': no readable source video next to pred/ '
+                  '(rerun it alone with --fps/--pixel-x/--pixel-y)')
+            continue
         info_rows.append([video, ifps, ipx, ipy])
         print(video + ': ' + str(len(frames)) + ' frames, fps=' + str(round(ifps, 3))
               + ', ' + str(int(ipx)) + 'x' + str(int(ipy)))
