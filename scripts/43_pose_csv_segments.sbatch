@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=ibdp-poseseg
-#SBATCH --partition=gl40s_short
+#SBATCH --partition=gl40s_long        # _long carries the 24h walltime
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=04:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=/gpfs/scratch/sd6701/personal/ibdp/outputs/poses_walk_stand/logs/poseseg-%j.out
 #SBATCH --error=/gpfs/scratch/sd6701/personal/ibdp/outputs/poses_walk_stand/logs/poseseg-%j.out
 #
