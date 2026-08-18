@@ -6,8 +6,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
-#SBATCH --output=/gpfs/scratch/sd6701/personal/ibdp/outputs/poses/logs/pose1-%j.out
-#SBATCH --error=/gpfs/scratch/sd6701/personal/ibdp/outputs/poses/logs/pose1-%j.out
+#SBATCH --output=/gpfs/scratch/sd6701/personal/ibdp/outputs/poses_chambers/logs/pose1-%j.out
+#SBATCH --error=/gpfs/scratch/sd6701/personal/ibdp/outputs/poses_chambers/logs/pose1-%j.out
 #
 # ViTPose over EVERY downloaded Chambers video inside ONE job on ONE node --
 # the single-allocation alternative to the 64-task array in scripts/41.
@@ -18,7 +18,7 @@
 # the list with GPUS workers.
 #
 # SUBMIT:
-#   mkdir -p /gpfs/scratch/sd6701/personal/ibdp/outputs/poses/logs
+#   mkdir -p /gpfs/scratch/sd6701/personal/ibdp/outputs/poses_chambers/logs
 #   sbatch scripts/42_pose_chambers_one_node.sbatch                  # 1 GPU, sequential
 #   sbatch --gres=gpu:l40s:4 --export=ALL,GPUS=4 \
 #          scripts/42_pose_chambers_one_node.sbatch                  # 4 GPUs, 4 in parallel
@@ -35,7 +35,7 @@ set -uo pipefail
 ROOT="${ROOT:-/gpfs/scratch/sd6701/personal/ibdp}"
 MM="${MM:-/gpfs/scratch/sd6701/personal/mmpose}"
 VIDEOS="$ROOT/datasets/chambers_infant_youtube/videos"
-OUTDIR="$ROOT/outputs/poses"
+OUTDIR="${OUTDIR:-$ROOT/outputs/poses_chambers}"
 SECONDS_PER_VIDEO="${SECONDS_PER_VIDEO:-0}"
 GPUS="${GPUS:-1}"
 

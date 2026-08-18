@@ -6,8 +6,8 @@
 #SBATCH --mem=32G
 #SBATCH --time=04:00:00
 #SBATCH --array=0-63%8                # one task per video, 8 at a time
-#SBATCH --output=/gpfs/scratch/sd6701/personal/ibdp/outputs/poses/logs/pose-%A_%a.out
-#SBATCH --error=/gpfs/scratch/sd6701/personal/ibdp/outputs/poses/logs/pose-%A_%a.out
+#SBATCH --output=/gpfs/scratch/sd6701/personal/ibdp/outputs/poses_chambers/logs/pose-%A_%a.out
+#SBATCH --error=/gpfs/scratch/sd6701/personal/ibdp/outputs/poses_chambers/logs/pose-%A_%a.out
 #
 # ViTPose over every downloaded Chambers video, one video per array task.
 #
@@ -16,7 +16,7 @@
 # side. 64 one-card tasks also queue far faster than one multi-card job.
 #
 # SUBMIT:
-#   mkdir -p /gpfs/scratch/sd6701/personal/ibdp/outputs/poses/logs
+#   mkdir -p /gpfs/scratch/sd6701/personal/ibdp/outputs/poses_chambers/logs
 #   sbatch scripts/41_pose_chambers_all.sbatch
 #   squeue -u $USER
 #
@@ -36,7 +36,7 @@ set -uo pipefail
 ROOT="${ROOT:-/gpfs/scratch/sd6701/personal/ibdp}"
 MM="${MM:-/gpfs/scratch/sd6701/personal/mmpose}"
 VIDEOS="$ROOT/datasets/chambers_infant_youtube/videos"
-OUTDIR="$ROOT/outputs/poses"
+OUTDIR="${OUTDIR:-$ROOT/outputs/poses_chambers}"
 SECONDS_PER_VIDEO="${SECONDS_PER_VIDEO:-0}"     # 0 = whole video
 
 CONDA_BASE="${CONDA_BASE:-$HOME/miniconda3}"
