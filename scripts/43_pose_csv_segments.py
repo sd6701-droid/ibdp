@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import csv
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -110,6 +111,16 @@ def main():
 
     if not args.csv.is_file():
         raise SystemExit(f"no such csv: {args.csv}")
+
+    # ffprobe reads clip durations, ffmpeg does the trim. Both live in the
+    # pose env; the gpc/base envs do NOT have them, and without this check the
+    # first clip dies in a subprocess traceback that says nothing about which
+    # env you are in.
+    missing = [t for t in ("ffprobe", "ffmpeg") if not shutil.which(t)]
+    if missing:
+        raise SystemExit(
+            f"{', '.join(missing)} not on PATH (env: {sys.prefix}).\n"
+            "activate the pose env first:  conda activate vitpose")
 
     only = {x.strip() for x in args.only.split(",")} if args.only else None
     rows = load_rows(args.csv, only)
