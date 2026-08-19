@@ -95,6 +95,12 @@ def main():
     ap.add_argument('--min-features', type=int, default=19,
                     help='flag videos scoring on fewer than this many of the '
                          '38 features (half by default)')
+    ap.add_argument('--labels', type=Path, default=None,
+                    help="csv with the ORIGINAL clinical risk labels to join "
+                         "for verification: either video,risk (exact video "
+                         "names) or infant,risk (matched on the infant id "
+                         "parsed from names like 822487-7_1_1_GP1). risk may "
+                         "be 0/1/2 or low/moderate/high.")
     args = ap.parse_args()
 
     ref = pd.read_pickle(args.reference)
@@ -124,6 +130,31 @@ def main():
     # Most atypical first: lowest likelihood = most negative z.
     scores = scores.sort_values('z')
 
+    # Infant id, parsed Chambers-style: '822487-7_1_1_GP1_1' -> tokens
+    # [study, infant, session, ...] after '-'->'_'. Lets multiple videos of
+    # one infant be grouped, and lets per-infant labels join.
+    def infant_of(video):
+        toks = str(video).replace('-', '_').split('_')
+        return toks[1] if len(toks) > 1 and toks[1].isdigit() else str(video)
+    scores.insert(1, 'infant', scores.video.map(infant_of))
+
+    if args.labels:
+        RISK_NAMES = {'0': 'low', '1': 'moderate', '2': 'high'}
+        lab = pd.read_csv(args.labels, dtype=str)
+        lab.columns = [c.strip().lower() for c in lab.columns]
+        if 'risk' not in lab.columns or not (
+                {'video', 'infant'} & set(lab.columns)):
+            raise SystemExit('--labels needs a risk column plus video or infant')
+        # Normalise every risk-ish column (risk, risk_chron, risk_corr...)
+        for c in [c for c in lab.columns if c.startswith('risk')]:
+            lab[c] = (lab[c].astype(str).str.strip().str.lower()
+                      .map(lambda r: RISK_NAMES.get(r, r)))
+        key = 'video' if 'video' in lab.columns else 'infant'
+        extra = [c for c in lab.columns if c != key and c not in scores.columns]
+        scores = pd.merge(scores, lab[[key] + extra].drop_duplicates(key),
+                          on=key, how='left')
+        scores['risk'] = scores.risk.fillna('unlabelled')
+
     out = args.out or HERE / 'data/interim' / f'surprise_{tgt_name}.csv'
     out.parent.mkdir(parents=True, exist_ok=True)
     scores.to_csv(out, index=False)
@@ -132,13 +163,28 @@ def main():
           f'surprise mu={mu:.1f} sd={sd:.1f})')
     print(f'scored   : {tgt_name} ({len(scores)} videos) -> {out}')
     print()
-    cols = ['video', 'surprise', 'n_features', 'z', 'p', 'low_coverage']
+    cols = ['video', 'infant', 'surprise', 'n_features', 'z', 'p', 'low_coverage']
+    if 'risk' in scores.columns:
+        cols.append('risk')
     print(scores[cols].to_string(index=False,
                                  float_format=lambda v: f'{v:.3f}'))
     flagged = scores[scores.low_coverage]
     if len(flagged):
         print(f'\nNOTE: {len(flagged)} video(s) scored on < {args.min_features} '
               f'of 38 features (poor tracking) -- interpret with care.')
+
+    # The verification view: does surprise separate the ORIGINAL risk groups?
+    # (Chambers et al. fig., as a table: mean z per group should fall
+    # low > moderate > high if the signal transfers.)
+    if 'risk' in scores.columns:
+        order = ['low', 'moderate', 'high', 'unlabelled']
+        grp = (scores.groupby('risk')
+               .agg(n_videos=('video', 'size'), n_infants=('infant', 'nunique'),
+                    mean_z=('z', 'mean'), median_z=('z', 'median'),
+                    min_z=('z', 'min'))
+               .reindex([r for r in order if r in set(scores.risk)]))
+        print('\nsurprise by ORIGINAL risk label (verification):')
+        print(grp.to_string(float_format=lambda v: f'{v:.3f}'))
 
 
 if __name__ == '__main__':

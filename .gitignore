@@ -122,3 +122,7 @@ chamber_et_al_src/
 # never reach git (kinematics/data/ stays covered by data/, and the csv/pkl
 # patterns catch strays).
 !kinematics/src/data/
+# Chambers et al. PUBLISHED clinical metadata (risk labels for their released
+# 31-video cohort) -- public dataset, not PHI, and run_surprise.py --labels
+# needs it on the cluster.
+!kinematics/labels_chambers_clinical.csv
