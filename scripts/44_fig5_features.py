@@ -65,6 +65,11 @@ _shim_legacy_pandas()
 SIDED = re.compile(r"^(?P<stat>.+?)_(?P<side>[LR])(?P<joint>Wrist|Ankle|Elbow|Knee|Hip|Shoulder|Ear|Eye)$")
 # lrCorr_x_Wrist / lrCorr_angle_Elbow -- inherently two-limb, no side token.
 LRCORR = re.compile(r"^lrCorr_(?P<axis>x|angle)_(?P<joint>\w+)$")
+# Pose dirs cut by scripts/46 are named <video_id>_<start>-<end>s, so `video`
+# carries the WINDOW, not the 11-char id meta_data_yt.pkl is keyed on. Anchor
+# on the suffix rather than slicing 11 characters off the front: YouTube ids
+# contain _ and - (2-qT--mHx_8, _eyl8uuoFcg), so a fixed-width slice is a trap.
+WINDOW = re.compile(r"^(?P<vid>.+)_(?P<start>\d+)-(?P<end>\d+)s$")
 
 
 def to_joint_naming(df: pd.DataFrame) -> pd.DataFrame:
@@ -103,6 +108,41 @@ def to_joint_naming(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def collapse_windows(df: pd.DataFrame) -> pd.DataFrame:
+    """<video_id>_<start>-<end>s rows -> one row per <video_id>.
+
+    A no-op on a whole-video pose tree, where `video` is already the id.
+    Chambers analysed a window per video and Figure 5 plots ONE point per
+    video, so a video with several windows has to become one row; the numeric
+    features are averaged unweighted, since build_features does not carry the
+    per-window frame counts a weighted mean would need.
+    """
+    m = df["video"].astype(str).str.extract(WINDOW)
+    if m["vid"].isna().all():
+        return df                       # whole-video tree: nothing to strip
+    if m["vid"].isna().any():
+        bad = df.loc[m["vid"].isna(), "video"].tolist()[:5]
+        raise SystemExit(
+            "some rows are windowed and some are not -- refusing to guess "
+            f"which tree this is. Unparsed: {bad}")
+
+    out = df.copy()
+    out["video"] = m["vid"]
+    counts = out["video"].value_counts()
+    multi = counts[counts > 1]
+    if multi.empty:
+        print(f"     stripped window suffixes ({len(out)} videos, "
+              "one window each)")
+        return out
+
+    num = list(out.select_dtypes("number").columns)
+    collapsed = out.groupby("video", as_index=False)[num].mean()
+    print(f"     {len(out)} windows -> {len(collapsed)} videos; averaged "
+          f"{len(multi)} multi-window video(s): "
+          + ", ".join(f"{v} (x{n})" for v, n in multi.items()))
+    return collapsed
+
+
 def youtube_ids(url_pose_csv: Path) -> pd.DataFrame:
     """video_number -> 11-char YouTube id, from the pose dataset's URL list."""
     df = pd.read_csv(url_pose_csv)
@@ -129,6 +169,7 @@ def main():
     wrist = [c for c in joint.columns if c.startswith("Wrist_")]
     print(f"     -> {len(joint.columns) - 1} joint-level features "
           f"({len(wrist)} wrist)")
+    joint = collapse_windows(joint)
 
     url_pose = args.chambers / "URL_pose_dataset.csv"
     meta_yt = args.meta_yt or (args.chambers / "meta_data_yt.pkl")
