@@ -92,6 +92,11 @@ def main():
     ap.add_argument("--palette", choices=sorted(PALETTES), default="repo")
     ap.add_argument("--order", type=int, default=1,
                     help="polynomial order for the regression fit")
+    ap.add_argument("--ci", type=int, default=0,
+                    help="confidence band width in percent (e.g. 95); 0 (the "
+                         "default) draws no band. With <10 points clustered at "
+                         "one age the bootstrap CI is unbounded and swamps the "
+                         "axes, so off is the sane default here.")
     ap.add_argument("--label", action="store_true",
                     help="number every point and write a <out>_labels.csv "
                          "mapping number -> video, so an outlier on the plot "
@@ -132,6 +137,7 @@ def main():
                 continue
             sns.regplot(x="age_in_weeks", y=feat, data=sub, ax=ax,
                         order=args.order, color=colours[risk],
+                        ci=args.ci if args.ci > 0 else None,
                         scatter_kws={"s": 18, "alpha": 0.6},
                         line_kws={"linewidth": 2},
                         label=f"{name} (n={len(sub)})")
@@ -143,6 +149,12 @@ def main():
                                 (row["age_in_weeks"], row[feat]),
                                 fontsize=6, alpha=0.9,
                                 xytext=(2, 2), textcoords="offset points")
+        # Scale the axis to the data, not the confidence bands -- a small
+        # group's CI can fan out far past every point and squash the rest.
+        vals = df[feat].dropna()
+        if not vals.empty:
+            span = (vals.max() - vals.min()) or 1.0
+            ax.set_ylim(vals.min() - 0.1 * span, vals.max() + 0.1 * span)
         ax.set_xlabel("age (weeks)")
         ax.set_ylabel(LABELS.get(feat, feat))
         ax.set_title(feat, fontsize=10)
