@@ -37,8 +37,12 @@ def main():
     args = ap.parse_args()
 
     df = pd.read_csv(args.scores)
-    if 'risk' not in df.columns:
-        raise SystemExit('no risk column -- rerun run_surprise.py with --labels')
+    # No clinical labels? Segregate by SCORE instead: the bands become
+    # candidate risk groups (clearly marked as score-derived, not BINS).
+    candidate = 'risk' not in df.columns
+    if candidate:
+        df['risk'] = np.where(df.z <= -1.96, 'high',
+                              np.where(df.z <= -1, 'moderate', 'low'))
     df = df[df.risk.isin(ORDER)]
 
     groups = {g: (df[df.risk == g], COLORS[g]) for g in ORDER}
@@ -72,9 +76,9 @@ def main():
         ax.plot([g.z.mean()] * 2, [i - .28, i + .28],
                 color=color, lw=2, zorder=2)
         # every atypical dot gets named -- infant id on clinical rows, the
-        # video id on the reference row (few enough there to stay legible)
+        # video id on the reference row and in candidate (unlabelled) mode
         for _, r in g[g.z <= -1.96].iterrows():
-            name = (str(r.get('infant', '')) if group in ORDER
+            name = (str(r.get('infant', '')) if group in ORDER and not candidate
                     else str(r.video)[:11])
             ax.annotate(name, (r.z, y[g.index.get_loc(r.name)]),
                         textcoords='offset points', xytext=(0, 9),
@@ -94,7 +98,9 @@ def main():
     ax.invert_yaxis()
     ax.set_xlabel('Bayesian surprise, z vs YouTube reference '
                   '(← more atypical movement)', fontsize=9)
-    ax.set_title('Movement atypicality by clinical risk group '
+    ax.set_title('Movement atypicality: score-based risk candidates '
+                 '(no clinical labels)' if candidate else
+                 'Movement atypicality by clinical risk group '
                  '(BINS, Chambers et al. cohort)', fontsize=11, loc='left')
     for s in ('top', 'right', 'left'):
         ax.spines[s].set_visible(False)
