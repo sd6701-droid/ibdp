@@ -163,7 +163,9 @@ def smooth(d, var, winmed, winmean):
 
 def comp_joint_angle(df, joint_str):
     df = df.loc[(df.bp=='L'+joint_str)|(df.bp=='R'+joint_str)]
-    df = pd.pivot_table(df, columns = ['bp'], values=['x', 'y'], index=['frame'])
+    # dropna=False: a video where one side's joint is NEVER confidently seen
+    # (all-NaN column) must yield NaN angles, not a KeyError on the pivot.
+    df = pd.pivot_table(df, columns = ['bp'], values=['x', 'y'], index=['frame'], dropna=False)
     # zangle =np.arctan2(Rj.y.iloc[0]-Lj.y.iloc[0],Rj.x.iloc[0]-Lj.x.iloc[0])
     df[joint_str+'_angle']= np.arctan2((df['y', 'R'+joint_str]-df['y', 'L'+joint_str]),(df['x', 'R'+joint_str]-df['x', 'L'+joint_str]))
     df = df.drop(['x', 'y'], axis=1)
@@ -171,7 +173,8 @@ def comp_joint_angle(df, joint_str):
 
 def comp_center_joints(df, joint_str, jstr):
     df = df.loc[(df.bp=='L'+joint_str)|(df.bp=='R'+joint_str)]
-    df = pd.pivot_table(df, columns = ['bp'], values=['x', 'y'], index=['frame'])
+    # dropna=False: same missing-side guard as comp_joint_angle above.
+    df = pd.pivot_table(df, columns = ['bp'], values=['x', 'y'], index=['frame'], dropna=False)
     # zangle =np.arctan2(Rj.y.iloc[0]-Lj.y.iloc[0],Rj.x.iloc[0]-Lj.x.iloc[0])
     df[jstr+'y']= (df['y', 'R'+joint_str]+df['y', 'L'+joint_str])/2
     df[jstr+'x']= (df['x', 'R'+joint_str]+df['x', 'L'+joint_str])/2
