@@ -12,10 +12,11 @@ A 3x4 grid, one panel per feature in feature_list_wrists, age_in_weeks on x and
 the feature value on y. Each panel overlays four regressions: the YouTube
 reference infants (risk 0) plus the clinical low / moderate / high risk groups.
 
-RUNS WITHOUT THE CLINICAL HALF. Pass --reference alone and you get the same
-grid with the reference group only -- useful for checking the reference data
-before the clinical features exist. The legend says which groups are present,
-so a one-group plot cannot be mistaken for the full figure.
+RUNS WITH EITHER HALF ALONE. Pass --reference alone for the reference group
+only (useful for checking the reference data before the clinical features
+exist), or --clinical alone for the three clinical risk groups without the
+YouTube reference. The legend says which groups are present, so a partial
+plot cannot be mistaken for the full figure.
 
 COLOURS: the published caption and the repo's own notebook disagree (the repo
 uses grey/green/blue/red). We follow the repo, since that is what actually
@@ -63,10 +64,12 @@ PALETTES = {
 }
 
 
-def load(reference: Path, clinical: Path | None) -> pd.DataFrame:
-    ref = pd.read_pickle(reference)
-    ref["risk"] = 0
-    frames = [ref]
+def load(reference: Path | None, clinical: Path | None) -> pd.DataFrame:
+    frames = []
+    if reference is not None:
+        ref = pd.read_pickle(reference)
+        ref["risk"] = 0
+        frames.append(ref)
     if clinical is not None:
         clin = pd.read_pickle(clinical)
         if "risk" not in clin.columns:
@@ -74,6 +77,8 @@ def load(reference: Path, clinical: Path | None) -> pd.DataFrame:
                 f"{clinical} has no `risk` column -- it must carry 1/2/3 for "
                 "low/moderate/high (Chambers codes these 0/1/2, so add one).")
         frames.append(clin)
+    if not frames:
+        raise SystemExit("pass --reference, --clinical, or both")
     df = pd.concat(frames, ignore_index=True, sort=False)
     if "age_in_weeks" not in df.columns:
         raise SystemExit("no `age_in_weeks` column -- run scripts/44 first")
@@ -82,8 +87,9 @@ def load(reference: Path, clinical: Path | None) -> pd.DataFrame:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--reference", type=Path, required=True,
-                    help="YouTube reference features (risk 0)")
+    ap.add_argument("--reference", type=Path, default=None,
+                    help="YouTube reference features (risk 0); omit to plot "
+                         "the clinical groups alone")
     ap.add_argument("--clinical", type=Path, default=None,
                     help="clinical features carrying risk 1/2/3; omit to plot "
                          "the reference group alone")
