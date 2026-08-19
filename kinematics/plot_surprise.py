@@ -32,6 +32,11 @@ def main():
     ap.add_argument('--reference-scores', type=Path, default=None,
                     help='surprise csv of the reference cohort scored against '
                          'itself -- adds a baseline row to the figure')
+    ap.add_argument('--extra-scores', type=Path, default=None,
+                    help='surprise csv of one more (unlabelled) cohort to '
+                         'compare, e.g. the walk/stand splits -- one extra row')
+    ap.add_argument('--extra-label', default='walk/stand splits',
+                    help='row label for --extra-scores')
     ap.add_argument('--out', type=Path, default=None,
                     help='output image (default: <scores>_plot.png)')
     args = ap.parse_args()
@@ -46,6 +51,10 @@ def main():
     df = df[df.risk.isin(ORDER)]
 
     groups = {g: (df[df.risk == g], COLORS[g]) for g in ORDER}
+    if args.extra_scores:
+        # Comparison cohort sits between the yardstick and the risk groups.
+        groups = {args.extra_label: (pd.read_csv(args.extra_scores), '#4a3aa7'),
+                  **groups}
     if args.reference_scores:
         ref = pd.read_csv(args.reference_scores)
         # Baseline population row first, in a neutral -- it is the yardstick,
@@ -78,8 +87,12 @@ def main():
         # every atypical dot gets named -- infant id on clinical rows, the
         # video id on the reference row and in candidate (unlabelled) mode
         for _, r in g[g.z <= -1.96].iterrows():
-            name = (str(r.get('infant', '')) if group in ORDER and not candidate
-                    else str(r.video)[:11])
+            if group in ORDER and not candidate:
+                name = str(r.get('infant', ''))
+            else:
+                # '<video>__split_NN' -> 'split_NN'; plain ids get truncated
+                v = str(r.video)
+                name = v.split('__', 1)[1] if '__' in v else v[:11]
             ax.annotate(name, (r.z, y[g.index.get_loc(r.name)]),
                         textcoords='offset points', xytext=(0, 9),
                         ha='center', fontsize=7.5, color='#52514e')
