@@ -34,7 +34,10 @@ set -uo pipefail
 
 ROOT="${ROOT:-/gpfs/scratch/sd6701/personal/ibdp}"
 MM="${MM:-/gpfs/scratch/sd6701/personal/mmpose}"
-VIDEOS="$ROOT/datasets/chambers_infant_youtube/videos"
+# VIDEOS/OUTDIR are overridable so the same job can sweep the WHOLE videos
+# or the labelled windows in clips/ -- Chambers analysed only the window,
+# so whole-video features are not comparable to theirs.
+VIDEOS="${VIDEOS:-$ROOT/datasets/chambers_infant_youtube/videos}"
 OUTDIR="${OUTDIR:-$ROOT/outputs/poses_chambers}"
 SECONDS_PER_VIDEO="${SECONDS_PER_VIDEO:-0}"
 GPUS="${GPUS:-1}"
