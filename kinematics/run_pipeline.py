@@ -64,7 +64,12 @@ def main():
         print('exists, skipping (--force to redo)')
 
     print('=== 2/3 preprocess (interpolate, smooth, normalise, dynamics)')
-    if args.force or not (est / 'processed_pose_estimates_coords.pkl').exists():
+    # BOTH outputs, not just coords: the stage writes coords then angles, and
+    # stage 3 reads both. Checking only coords means a job killed between the
+    # two writes skips this stage on resubmit and dies in stage 3 instead.
+    stage2 = ['processed_pose_estimates_coords.pkl',
+              'processed_pose_estimates_angles.pkl']
+    if args.force or not all((est / f).exists() for f in stage2):
         import preprocess_pose_data
         preprocess_pose_data.main(args.data_set)
     else:

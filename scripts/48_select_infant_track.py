@@ -370,6 +370,104 @@ def select_track(profiles, prior, min_presence, min_ratios, max_cost):
 
 
 # --------------------------------------------------------------------------
+# stage C' -- how many infants are in this clip?
+# --------------------------------------------------------------------------
+def count_infants(tracks, profiles, prior, n_frames, max_cost, min_presence):
+    """-> (n_infants, infant_track_ids, per-frame concurrency stats).
+
+    The naive count -- "how many tracks look like an infant" -- is wrong,
+    because the tracker fragments. One infant walking behind a sofa becomes
+    four tracks and would be reported as four infants.
+
+    What actually distinguishes two infants from one fragmented infant is
+    CO-OCCURRENCE: two infants appear in the SAME FRAME, whereas the fragments
+    of one infant are mostly disjoint in time (a track ends because the
+    detection was lost, and the next begins after it). So count, per frame, how
+    many infant-plausible tracks are simultaneously present, and take the
+    median over frames where at least one is.
+
+    Median, not max: a single frame of duplicate detection on one infant (the
+    detector briefly firing twice on the same body) would send a max-based
+    count to 2 for the whole clip.
+    """
+    ok = [p for p in profiles if p['presence'] >= min_presence
+          and infant_cost(p, prior)[0] <= max_cost]
+    ids = [p['track_id'] for p in ok]
+    if not ids:
+        return 0, [], 0.0
+
+    concur = np.zeros(n_frames, dtype=int)
+    for tid in ids:
+        for fi, _ in tracks[tid]['frames']:
+            if 0 <= fi < n_frames:
+                concur[fi] += 1
+
+    live = concur[concur > 0]
+    if live.size == 0:
+        return 0, ids, 0.0
+    n = int(round(float(np.median(live))))
+    return max(n, 1), ids, float(np.mean(concur > 1))
+
+
+def cmd_count(args):
+    """Report how many infants each clip contains, so the walk/stand splits can
+    be filtered down to the single-infant ones."""
+    prior = json.loads(args.prior.read_text())['ratios']
+
+    dirs = sorted(d for d in glob.glob(os.path.join(args.poses_root, '*'))
+                  if os.path.isdir(os.path.join(d, 'pred')))
+    if not dirs:
+        raise SystemExit('no <split>/pred folders under ' + args.poses_root)
+
+    rows = []
+    for vd in dirs:
+        split = os.path.basename(vd)
+        frames = read_frames(os.path.join(vd, 'pred'))
+        if not frames:
+            print('SKIP %s: no frames' % split)
+            continue
+
+        tracks = link_tracks(frames, args.iou, args.max_gap)
+        profs = [track_profile(t, len(frames), args.kp_thr) for t in tracks]
+        n, ids, dbl = count_infants(tracks, profs, prior, len(frames),
+                                    args.max_cost, args.min_presence)
+
+        verdict = {0: 'no_infant'}.get(n, 'single' if n == 1 else 'multiple')
+        # Best cost over ALL tracks, not just accepted ones. On a no_infant
+        # clip this is the whole diagnosis: a value just over max_cost means
+        # the threshold rejected something borderline, while 30+ means there
+        # genuinely was no infant-shaped person in frame.
+        best = min((infant_cost(p, prior)[0] for p in profs
+                    if p['presence'] >= args.min_presence), default=np.inf)
+        rows.append({
+            'split': split, 'n_infants': n, 'verdict': verdict,
+            'n_tracks': len(tracks), 'n_infant_tracks': len(ids),
+            'best_cost': (round(best, 2) if np.isfinite(best) else 'no_track'),
+            'frac_frames_multi': round(dbl, 3),
+            'n_frames': len(frames),
+        })
+        print('%-28s %-9s n=%d  infant_tracks=%-3d of %-4d  best_cost=%-6s '
+              'multi_frames=%.0f%%'
+              % (split, verdict, n, len(ids), len(tracks),
+                 ('%.2f' % best if np.isfinite(best) else 'none'), 100 * dbl))
+
+    rows.sort(key=lambda r: (r['verdict'] != 'single', r['split']))
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    with args.out.open('w', newline='') as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+
+    keep = [r['split'] for r in rows if r['verdict'] == 'single']
+    args.keep_list.write_text('\n'.join(keep) + ('\n' if keep else ''))
+
+    print('\n%d splits -> %s' % (len(rows), args.out))
+    for v in ('single', 'multiple', 'no_infant'):
+        print('  %-10s %d' % (v, sum(1 for r in rows if r['verdict'] == v)))
+    print('  single-infant split names -> %s' % args.keep_list)
+
+
+# --------------------------------------------------------------------------
 # calibrate
 # --------------------------------------------------------------------------
 def cmd_calibrate(args):
@@ -681,6 +779,24 @@ def main():
     s.add_argument('--no-qa', action='store_true',
                    help='skip contact sheets (needs cv2 + the source video)')
     s.set_defaults(func=cmd_select)
+
+    n = sub.add_parser('count', help='how many infants per clip -- filters the '
+                                     'walk/stand splits to single-infant ones')
+    n.add_argument('--poses-root', default='outputs/poses_walk_stand')
+    n.add_argument('--prior', type=Path, default=DEFAULT_PRIOR)
+    n.add_argument('--out', type=Path,
+                   default=Path('outputs/walk_stand_infant_count.csv'))
+    n.add_argument('--keep-list', type=Path,
+                   default=Path('outputs/walk_stand_single_infant.txt'),
+                   help='newline-separated split names with exactly one infant')
+    n.add_argument('--kp-thr', type=float, default=0.3)
+    n.add_argument('--iou', type=float, default=0.3)
+    n.add_argument('--max-gap', type=int, default=15)
+    n.add_argument('--max-cost', type=float, default=6.0,
+                   help='a track must score at least this infant-like to be '
+                        'counted as an infant at all')
+    n.add_argument('--min-presence', type=float, default=0.05)
+    n.set_defaults(func=cmd_count)
 
     args = ap.parse_args()
     args.func(args)
